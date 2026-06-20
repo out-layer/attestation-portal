@@ -1,68 +1,48 @@
-//! attestation-portal server — central aggregator (+ later: verifier, public page, /admin).
+//! attestation-portal server — receives pushed node reports + serves them (+ later: verify, page, /admin).
 //!
-//! v1 foundation (this file): fans out to each per-node `agent` and serves the aggregated read-only
-//! attestation reports as JSON. SECURITY (see ../SECURITY.md):
-//!   - the node list is **operator config only** (the `NODES` env var) — it is NEVER request-derived,
-//!     so a request cannot make the server fetch an arbitrary URL (no SSRF).
-//!   - strict connect/overall timeouts; one node failing is non-fatal (its slot carries an error).
-//!   - read-only, anonymous, no secrets in responses.
+//! PUSH model (../SECURITY.md): each per-node `agent` makes an OUTBOUND, bearer-authed POST to
+//! `/ingest`. The server NEVER reaches into a TDX node — there is no fan-out, no SSRF surface, and no
+//! node credential here. It stores the latest report per `node_id` in memory and serves them
+//! read-only at `/api/attestation`. `/ingest` fails CLOSED when no token is configured.
 //!
-//! Following phases (built deliberately, to SECURITY.md): dcap-qvl quote verification + on-chain
-//! `is_measurements_approved` cross-check; the askama public HTML page; and a SEPARATE, authenticated,
-//! READ-ONLY `/admin` (not internet-exposed) — kept out of this binary's public surface.
+//! Following phases (to SECURITY.md): dcap-qvl quote verification + on-chain `is_measurements_approved`
+//! cross-check; the askama public HTML page; and a SEPARATE, authed (CF Access), READ-ONLY `/admin`.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use attestation_shared::NodeReport;
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    body::Bytes,
+    extract::{DefaultBodyLimit, State},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    routing::{get, post},
+    Json, Router,
+};
 use serde::Serialize;
 
 struct Config {
-    /// Operator-configured agent endpoints. NEVER request-derived (no SSRF).
-    nodes: Vec<NodeEndpoint>,
     bind: String,
+    /// Bearer token required on `/ingest`. None → ingest disabled (fail closed).
+    ingest_token: Option<String>,
 }
 
-#[derive(Clone)]
-struct NodeEndpoint {
-    /// Operator label (display only).
-    id: String,
-    /// Base URL of that node's agent (e.g. `http://10.0.0.2:9300`).
-    url: String,
+#[derive(Clone, Serialize)]
+struct StoredReport {
+    /// Unix seconds the portal received this push.
+    received_at: u64,
+    report: NodeReport,
 }
 
 struct AppState {
     cfg: Config,
-    http: reqwest::Client,
+    /// Latest report per node_id. Short-held std Mutex (no await while locked).
+    reports: Mutex<HashMap<String, StoredReport>>,
 }
 
-/// One node's slot in the aggregated response: either its report or a non-fatal error.
-#[derive(Serialize)]
-struct NodeResult {
-    node: String,
-    url: String,
-    report: Option<NodeReport>,
-    error: Option<String>,
-}
-
-/// Parse `NODES="a=http://h1:9300, b=http://h2:9300"` (or bare `http://h:9300,...`).
-fn parse_nodes(raw: &str) -> Vec<NodeEndpoint> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|entry| match entry.split_once('=') {
-            Some((id, url)) => NodeEndpoint {
-                id: id.trim().to_string(),
-                url: url.trim().trim_end_matches('/').to_string(),
-            },
-            None => NodeEndpoint {
-                id: entry.to_string(),
-                url: entry.trim_end_matches('/').to_string(),
-            },
-        })
-        .collect()
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 #[tokio::main]
@@ -73,28 +53,23 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let nodes = parse_nodes(&std::env::var("NODES").unwrap_or_default());
-    if nodes.is_empty() {
-        tracing::warn!(
-            "NODES is empty — set NODES=\"node-a=http://10.0.0.2:9300,...\" (operator config; never request-derived)"
-        );
-    }
     let cfg = Config {
-        nodes,
-        bind: std::env::var("SERVER_BIND").unwrap_or_else(|_| "127.0.0.1:8088".into()),
+        bind: env_or("SERVER_BIND", "127.0.0.1:8088"),
+        ingest_token: std::env::var("INGEST_TOKEN").ok().filter(|s| !s.is_empty()),
     };
-    tracing::info!(bind = %cfg.bind, nodes = cfg.nodes.len(), "starting attestation-portal server");
+    if cfg.ingest_token.is_none() {
+        tracing::warn!("INGEST_TOKEN unset — /ingest is DISABLED (fail closed). Set it to accept agent pushes.");
+    }
+    tracing::info!(bind = %cfg.bind, ingest = cfg.ingest_token.is_some(), "starting attestation-portal server");
 
     let state = Arc::new(AppState {
-        http: reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
-            .connect_timeout(Duration::from_secs(4))
-            .user_agent("attestation-portal-server")
-            .build()?,
         cfg,
+        reports: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
+        // 256 KiB is ample for a node report; bound it so an unauth body can't grow memory.
+        .route("/ingest", post(ingest).layer(DefaultBodyLimit::max(256 * 1024)))
         .route("/api/attestation", get(api_attestation))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state.clone());
@@ -107,28 +82,73 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Public, read-only: the aggregated attestation of every configured node.
-async fn api_attestation(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResult>> {
-    Json(collect_all(&state).await)
-}
-
-async fn collect_all(state: &AppState) -> Vec<NodeResult> {
-    futures::future::join_all(state.cfg.nodes.iter().map(|n| fetch_node(state, n))).await
-}
-
-async fn fetch_node(state: &AppState, n: &NodeEndpoint) -> NodeResult {
-    let url = format!("{}/attestation", n.url);
-    let mk = |report, error| NodeResult {
-        node: n.id.clone(),
-        url: n.url.clone(),
-        report,
-        error,
+/// Agent → portal push. Bearer-authed; fails closed if no token configured. Body bounded above.
+async fn ingest(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> StatusCode {
+    let Some(expected) = state.cfg.ingest_token.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE; // fail closed: no token configured
     };
-    match state.http.get(&url).send().await.and_then(|r| r.error_for_status()) {
-        Ok(resp) => match resp.json::<NodeReport>().await {
-            Ok(report) => mk(Some(report), None),
-            Err(e) => mk(None, Some(format!("decode: {e}"))),
-        },
-        Err(e) => mk(None, Some(format!("fetch: {e}"))),
+    if !bearer_ok(&headers, expected) {
+        return StatusCode::UNAUTHORIZED;
     }
+    let report: NodeReport = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("ingest: bad body: {e}");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    let node_id = report.node_id.clone();
+    let stored = StoredReport {
+        received_at: now_secs(),
+        report,
+    };
+    if let Ok(mut map) = state.reports.lock() {
+        map.insert(node_id.clone(), stored);
+    }
+    tracing::info!(node = %node_id, "ingested report");
+    StatusCode::OK
+}
+
+/// Public, read-only: the latest stored report per node.
+async fn api_attestation(State(state): State<Arc<AppState>>) -> Json<Vec<StoredReport>> {
+    let reports = match state.reports.lock() {
+        Ok(map) => {
+            let mut v: Vec<StoredReport> = map.values().cloned().collect();
+            v.sort_by(|a, b| a.report.node_id.cmp(&b.report.node_id));
+            v
+        }
+        Err(_) => Vec::new(),
+    };
+    Json(reports)
+}
+
+/// `Authorization: Bearer <token>` compared in constant time against the configured token.
+fn bearer_ok(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(token) = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    ct_eq(token.as_bytes(), expected.as_bytes())
+}
+
+/// Constant-time byte compare (length is allowed to leak — tokens are fixed length).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

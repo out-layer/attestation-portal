@@ -12,7 +12,5 @@ serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 axum.workspace = true
-reqwest.workspace = true
-futures.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -1,15 +1,17 @@
 //! attestation-agent — per-node, read-only attestation collector for the OutLayer TDX fleet.
 //!
-//! Runs ON a TDX host as the vmm-owning user (so it can read `/proc/<pid>/cmdline` of the qemu
-//! CVMs to discover their loopback guest-agent ports — the dstack vmm reassigns those ports on
-//! every CVM stop/start, so they must be discovered, not hard-coded). It:
-//!   1. queries the local dstack vmm `Status` for the VM list,
-//!   2. for each running CVM, finds its guest-agent host port and calls `Info`,
-//!   3. normalizes measurements + image digests + event log into a `NodeReport`,
-//!   4. serves it as JSON at `GET /attestation`.
+//! Runs ON a TDX host as the vmm-owning user (so it can read `/proc/<pid>/cmdline` of the qemu CVMs
+//! to discover their loopback guest-agent ports — the dstack vmm reassigns those on every CVM
+//! stop/start, so they must be discovered, not hard-coded). It collects the VM list + each CVM's
+//! guest-agent `Info`, normalizes it into a `NodeReport`, and **pushes it OUTBOUND** to the central
+//! portal's `/ingest` endpoint.
 //!
-//! It holds NO secrets and performs NO control actions. The off-host gateway `AcmeInfo` + KMS
-//! `GetMeta` endpoints and the on-chain checks are done by the central server, not here.
+//! SECURITY (../SECURITY.md): the node only ever makes OUTBOUND connections — the central portal
+//! never reaches INTO the TDX host, so a portal compromise yields no path/credential to this
+//! crown-jewel host. The agent holds no secrets beyond a low-stakes push token (the data it pushes is
+//! public; a leaked token at worst lets someone push fake reports, which on-chain/quote verification
+//! detects). It performs NO control actions. A loopback-only `/attestation` + `/healthz` server is
+//! kept for on-node debugging.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,8 +24,14 @@ use serde::Deserialize;
 
 struct Config {
     vmm_rpc: String,
+    /// Loopback debug server bind (NEVER 0.0.0.0).
     bind: String,
     node_id: String,
+    /// Portal `/ingest` URL to push to. None → push disabled (debug server only).
+    portal_url: Option<String>,
+    /// Bearer token for `/ingest` (low-stakes; data is public).
+    push_token: Option<String>,
+    push_interval: u64,
 }
 
 struct AppState {
@@ -52,8 +60,15 @@ async fn main() -> Result<()> {
         vmm_rpc: env_or("VMM_RPC", "http://127.0.0.1:11000"),
         bind: env_or("AGENT_BIND", "127.0.0.1:9300"),
         node_id: env_or("NODE_ID", &hostname()),
+        portal_url: std::env::var("PORTAL_INGEST_URL").ok().filter(|s| !s.is_empty()),
+        push_token: std::env::var("PUSH_TOKEN").ok().filter(|s| !s.is_empty()),
+        push_interval: env_or("PUSH_INTERVAL_SECS", "30").parse().unwrap_or(30),
     };
-    tracing::info!(vmm_rpc = %cfg.vmm_rpc, bind = %cfg.bind, node_id = %cfg.node_id, "starting attestation-agent");
+    tracing::info!(
+        vmm_rpc = %cfg.vmm_rpc, bind = %cfg.bind, node_id = %cfg.node_id,
+        push = cfg.portal_url.is_some(), interval = cfg.push_interval,
+        "starting attestation-agent"
+    );
 
     let state = Arc::new(AppState {
         http: reqwest::Client::builder()
@@ -64,16 +79,49 @@ async fn main() -> Result<()> {
         cfg,
     });
 
+    // Outbound push loop (the production data path). The node only ever connects OUT.
+    if state.cfg.portal_url.is_some() {
+        let st = state.clone();
+        tokio::spawn(async move { push_loop(st).await });
+    } else {
+        tracing::warn!("PORTAL_INGEST_URL unset — push disabled (loopback debug server only)");
+    }
+
+    // Loopback-only debug server.
     let app = Router::new()
         .route("/attestation", get(attestation))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state.clone());
-
     let listener = tokio::net::TcpListener::bind(&state.cfg.bind)
         .await
         .with_context(|| format!("bind {}", state.cfg.bind))?;
-    tracing::info!("listening on {}", state.cfg.bind);
+    tracing::info!("debug server on {}", state.cfg.bind);
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Periodically collect + push the node report OUTBOUND to the portal.
+async fn push_loop(state: Arc<AppState>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(state.cfg.push_interval));
+    loop {
+        ticker.tick().await;
+        match collect(&state).await {
+            Ok(report) => match push_once(&state, &report).await {
+                Ok(()) => tracing::info!(cvms = report.cvms.len(), "pushed attestation to portal"),
+                Err(e) => tracing::warn!("push failed: {e:#}"),
+            },
+            Err(e) => tracing::warn!("collect failed: {e:#}"),
+        }
+    }
+}
+
+async fn push_once(state: &AppState, report: &NodeReport) -> Result<()> {
+    let url = state.cfg.portal_url.as_deref().context("no portal url")?;
+    let mut req = state.http.post(url).json(report);
+    if let Some(token) = &state.cfg.push_token {
+        req = req.bearer_auth(token);
+    }
+    req.send().await?.error_for_status()?;
     Ok(())
 }
 
@@ -252,7 +300,7 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "node".into())
 }
 
-/// Wrap anyhow errors so axum handlers can `?` and return 500 with a logged cause.
+/// Wrap anyhow errors so the loopback debug handler can `?` and return 500 with a logged cause.
 struct AppError(anyhow::Error);
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
