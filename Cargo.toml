@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["shared", "agent"]
-# server + web crates land next (central aggregator + askama page + /admin).
+members = ["shared", "agent", "server"]
+# web/askama page + dcap-qvl verification + /admin land in following phases (see server/ + SECURITY.md).
 
 [workspace.package]
 edition = "2021"
@@ -16,5 +16,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 regex = "1"
+futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
