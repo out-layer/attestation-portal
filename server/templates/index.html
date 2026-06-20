@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{# Public attestation INDEX — the compact LIST. One row per APP (grouped by `app_id`), not per
+   running instance: multiple instances (e.g. two worker instances) share one `app_id` and collapse
+   to a single row. Every `{{ }}` is auto-escaped by askama — NO `|safe` anywhere, because names /
+   ids / hashes arrive over the wire (defense-in-depth against XSS).
+
+   Each row links to `/app/<app_id>`, the per-CVM detail page with the full sectioned "verified
+   aspects" view for EVERY instance. We keep this list intentionally light: display name, role/network
+   badges, an instance-count chip (only when >1), aggregate status, the freshness pill (node level),
+   and a single AGGREGATE verdict chip (✓ Verified / ✗ Check failed / verifying…). #}
+
+{% block content %}
+<header class="site">
+  <h1>OutLayer — TEE Attestation</h1>
+  <p class="tagline">Live proof that the OutLayer fleet runs inside genuine Intel TDX TEEs.</p>
+</header>
+
+<div class="intro">
+  Each row below is one confidential VM (CVM) running on a self-hosted Intel TDX host. For every CVM
+  we take the hardware-signed TDX <strong>quote</strong>, verify its <strong>Intel DCAP</strong>
+  signature and TCB chain against <strong>Intel's PCS</strong> collateral, and cross-check the
+  measured code against the <strong>on-chain approved measurements</strong>.
+  <strong>Click a worker</strong> to see its full, per-aspect verification.
+</div>
+
+{% if nodes.is_empty() %}
+  <div class="empty">No nodes reporting yet. Attestation will appear here once an agent pushes a report.</div>
+{% else %}
+  {% for node in nodes %}
+  <section class="node">
+    <div class="node-head">
+      <h2>{{ node.node_id }}</h2>
+      <span class="pill pill-{{ node.last_seen_class }}">last push {{ node.last_seen_human }}</span>
+    </div>
+
+    <ul class="rows">
+      {% for row in node.rows %}
+      <li class="row-item">
+        <a class="row-link" href="/app/{{ row.app_id }}">
+          <span class="row-name">{{ row.name }}</span>
+          <span class="badge">{{ row.role_label }}</span>
+          {% match row.network_label %}
+            {% when Some with (net) %}<span class="badge">{{ net }}</span>
+            {% when None %}
+          {% endmatch %}
+          {% if row.multi_instance %}
+          <span class="count" title="multiple running instances share this app_id">{{ row.instance_count }} instances</span>
+          {% endif %}
+          <span class="row-status">{{ row.status }}</span>
+          <span class="sum sum-{{ row.summary_class }}">{{ row.summary_label }}</span>
+          <span class="row-chevron" aria-hidden="true">›</span>
+        </a>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endfor %}
+{% endif %}
+
+<footer class="site">
+  Quotes are verified server-side against Intel's PCS collateral (Intel DCAP signature chain — not
+  Intel Trust Authority) and cross-checked against on-chain approved measurements. Open any worker for
+  the full per-aspect breakdown and the raw, independently-verifiable quote.
+</footer>
+{% endblock %}

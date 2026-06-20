@@ -1,0 +1,296 @@
+{% extends "base.html" %}
+
+{# Per-app DETAIL page (`/app/<app_id>`). The full "verified aspect" stack for every CVM instance
+   sharing this app_id — multiple running instances can share one app_id (e.g. two worker instances),
+   so we render them ALL, each its own card, so nothing is hidden.
+
+   Every `{{ }}` is auto-escaped by askama — NO `|safe` anywhere, because names / ids / hashes / the
+   app-compose / image refs / URLs arrive over the wire (defense-in-depth against XSS).
+
+   Layout per CVM: App header, TDX Hardware Attestation, Source Code, Zero Trust Gateway, App OS,
+   KMS / deploy-time key provisioning — plus our on-chain DAO approval (in the TDX-Hardware verdict row). Honesty: we
+   verify the Intel DCAP signature + TCB chain against Intel's PCS collateral, NOT Intel Trust
+   Authority. #}
+
+{% block content %}
+<p class="backlink"><a href="/">← all workers</a></p>
+
+<header class="site">
+  <h1>OutLayer — TEE Attestation</h1>
+  <p class="tagline">
+    Full per-aspect verification for app
+    <span class="app-id-head">{{ app_id }}</span>.
+  </p>
+</header>
+
+<div class="intro">
+  Each card below is one confidential VM (CVM) instance running this app on a self-hosted Intel TDX
+  host, broken down by <strong>verified aspect</strong>. For every CVM we take the hardware-signed TDX
+  <strong>quote</strong>, verify its <strong>Intel DCAP</strong> signature and TCB chain against
+  <strong>Intel's PCS</strong> collateral, and cross-check the measured code against the
+  <strong>on-chain approved measurements</strong>. A green verdict means the TEE is genuine and
+  running exactly the code the contract approved — nothing here is self-asserted, and every quote can
+  be re-verified independently. We verify the Intel DCAP signature chain ourselves; this is
+  <strong>not Intel Trust Authority</strong>.
+</div>
+
+{% for cvm in cvms %}
+<article class="card{% if cvm.verdict.failing %} failing{% endif %}">
+
+  {# ============================ 1. App header ============================ #}
+  <div class="card-head">
+    <span class="name">{{ cvm.name }}</span>
+    <span class="badge">{{ cvm.role_label }}</span>
+    {% match cvm.network_label %}
+      {% when Some with (net) %}<span class="badge">{{ net }}</span>
+      {% when None %}
+    {% endmatch %}
+    {% if cvm.instance_total > 1 %}
+    <span class="count" title="this app_id has multiple running instances">instance {{ cvm.instance_index }} of {{ cvm.instance_total }}</span>
+    {% endif %}
+    <span class="status">
+      {{ cvm.status }}{% match cvm.uptime %}{% when Some with (up) %} · up {{ up }}{% when None %}{% endmatch %}
+    </span>
+  </div>
+  <div class="app-meta">
+    <span class="m"><b>app_id</b> {{ cvm.app_id }}</span>
+    <span class="m"><b>vm_id</b> {{ cvm.vm_id }}</span>
+    <span class="m">attested via Intel DCAP (Intel PCS collateral)</span>
+    {% if cvm.kms_in_tee %}
+      <span class="m">KMS-in-TEE ✓</span>
+    {% endif %}
+    <span class="m">
+      gateway
+      {% match cvm.gateway_domain %}
+        {% when Some with (d) %}<b>{{ d }}</b>
+        {% when None %}n/a
+      {% endmatch %}
+    </span>
+  </div>
+
+  {% match cvm.collect_error %}
+    {% when Some with (e) %}<div class="err">collection error: {{ e }}</div>
+    {% when None %}
+  {% endmatch %}
+
+  {# ===================== 2. TDX Hardware — Attestation ===================== #}
+  <div class="sec core{% if cvm.verdict.failing %} failing{% endif %}">
+    <div class="sec-head">
+      <span class="num">2</span>
+      <h3>TDX Hardware — Attestation</h3>
+    </div>
+    <p class="sec-note">
+      The hardware-signed TDX quote, verified against Intel's PCS collateral — the Intel DCAP
+      signature chain, not Intel Trust Authority.
+    </p>
+
+    {# ---- Verdict chips ---- #}
+    <div class="verdicts">
+      {% if cvm.verdict.pending %}
+        <span class="vb pending">verifying…</span>
+      {% else %}
+        {% if cvm.verdict.sig_valid %}
+          <span class="vb good">Signature ✓</span>
+        {% else %}
+          <span class="vb bad">Signature ✗</span>
+        {% endif %}
+
+        <span class="vb {{ cvm.verdict.tcb_class }}">
+          TCB {% match cvm.verdict.tcb_status %}{% when Some with (s) %}{{ s }}{% when None %}unknown{% endmatch %}
+        </span>
+
+        {% match cvm.verdict.measurements_match %}
+          {% when Some with (ok) %}
+            {% if ok %}
+              <span class="vb good">Measurements ✓</span>
+            {% else %}
+              <span class="vb bad">Measurements ✗</span>
+            {% endif %}
+          {% when None %}
+            <span class="vb na">Measurements —</span>
+        {% endmatch %}
+
+        <span class="vb {{ cvm.verdict.on_chain.class() }}">
+          {% if cvm.verdict.on_chain.approved() %}
+            On-chain ✓ approved
+          {% else if cvm.verdict.on_chain.not_approved() %}
+            On-chain ✗ NOT approved
+          {% else %}
+            On-chain — n/a
+          {% endif %}
+          {% match cvm.verdict.on_chain_contract %}
+            {% when Some with (c) %}<span class="sub">({{ c }})</span>
+            {% when None %}
+          {% endmatch %}
+        </span>
+      {% endif %}
+    </div>
+
+    {% match cvm.verdict.verify_error %}
+      {% when Some with (e) %}<div class="err">verification error: {{ e }}</div>
+      {% when None %}
+    {% endmatch %}
+
+    {# ---- Decoded report (from the verified quote), else degrade to claimed measurements ---- #}
+    {% match cvm.decoded %}
+      {% when Some with (d) %}
+        <div class="kv">
+          {% for r in d.rows %}
+          <div class="row"><span class="k">{{ r.label }}</span><span class="v">{{ r.value }}</span></div>
+          {% endfor %}
+          <div class="row">
+            <span class="k">fmspc</span>
+            <span class="v">{% match d.fmspc %}{% when Some with (f) %}{{ f }}{% when None %}—{% endmatch %}</span>
+          </div>
+          {% if !cvm.verdict.advisory_ids.is_empty() %}
+          <div class="row">
+            <span class="k">advisory_ids</span>
+            <span class="v list">{% for a in cvm.verdict.advisory_ids %}<span>{{ a }}</span>{% endfor %}</span>
+          </div>
+          {% endif %}
+        </div>
+        <details class="details">
+          <summary>raw Intel TDX quote (hex)</summary>
+          <pre class="quote">{{ d.quote_hex }}</pre>
+          <a class="verify-link" href="{{ proof_explorer_url }}" target="_blank" rel="noopener noreferrer">independently verify this quote ↗</a>
+        </details>
+      {% when None %}
+        {# Not yet verified / extraction failed — show the report's CLAIMED registers instead. #}
+        <p class="sec-note">Quote not decoded yet — showing the measurements as reported (to be cryptographically verified).</p>
+        <div class="kv">
+          {% for m in cvm.measurements %}
+          <div class="row"><span class="k">{{ m.label }}</span><span class="v">{{ m.value }}</span></div>
+          {% endfor %}
+          {% if !cvm.verdict.advisory_ids.is_empty() %}
+          <div class="row">
+            <span class="k">advisory_ids</span>
+            <span class="v list">{% for a in cvm.verdict.advisory_ids %}<span>{{ a }}</span>{% endfor %}</span>
+          </div>
+          {% endif %}
+        </div>
+    {% endmatch %}
+  </div>
+
+  {# ===================== 3. Source Code — Compose ===================== #}
+  <div class="sec">
+    <div class="sec-head">
+      <span class="num">3</span>
+      <h3>Source Code — Compose</h3>
+    </div>
+    <p class="sec-note">The measured app-compose that pins exactly which container images run.</p>
+    {% if !cvm.images.is_empty() %}
+    <table class="imgs">
+      <thead>
+        <tr><th>Container</th><th>Image</th><th>Digest</th><th>Verify</th></tr>
+      </thead>
+      <tbody>
+        {% for img in cvm.images %}
+        <tr>
+          <td>{{ img.container }}</td>
+          <td class="img-ref">{{ img.image }}<span class="origin">{{ img.origin }}</span></td>
+          <td class="digest">{{ img.digest }}</td>
+          <td class="verify">
+            <a href="{{ img.sigstore_url }}" target="_blank" rel="noopener noreferrer">Sigstore ↗</a>
+            {% match img.release_url %}
+              {% when Some with (u) %}<a href="{{ u }}" target="_blank" rel="noopener noreferrer">release ↗</a>
+              {% when None %}
+            {% endmatch %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted-line">
+      Each digest above is the one measured into RTMR3, so the attestation binds the running code
+      to this exact image; the Sigstore link ties that digest back to its build provenance.
+    </p>
+    {% endif %}
+    {% match cvm.app_compose %}
+      {% when Some with (c) %}
+        <details class="details">
+          <summary>app-compose (measured source identity)</summary>
+          <pre class="quote">{{ c }}</pre>
+        </details>
+      {% when None %}
+        <p class="muted-line">compose not reported yet (agent predates app-compose forwarding)</p>
+    {% endmatch %}
+    {% if !cvm.image_digests.is_empty() %}
+    <div class="kv">
+      <div class="row">
+        <span class="k">image_digests</span>
+        <span class="v list">{% for d in cvm.image_digests %}<span>{{ d }}</span>{% endfor %}</span>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  {# ===================== 4. Network — Zero Trust Gateway ===================== #}
+  <div class="sec">
+    <div class="sec-head">
+      <span class="num">4</span>
+      <h3>Network — Zero Trust Gateway</h3>
+    </div>
+    {% match cvm.gateway_domain %}
+      {% when Some with (d) %}
+        <p class="sec-note">TLS terminates <em>inside</em> the TEE — the gateway never sees plaintext.</p>
+        <div class="kv">
+          <div class="row"><span class="k">guarded domain</span><span class="v">{{ d }}</span></div>
+        </div>
+      {% when None %}
+        <p class="muted-line">no app-fronted gateway domain for this role (n/a)</p>
+    {% endmatch %}
+  </div>
+
+  {# ===================== 5. App OS ===================== #}
+  <div class="sec">
+    <div class="sec-head">
+      <span class="num">5</span>
+      <h3>App OS</h3>
+    </div>
+    <p class="sec-note">
+      The measured dstack guest OS image. The version is read live from each CVM's vm_config; the
+      <code>os_image_hash</code> is the precise, measured OS identity.
+      <a href="{{ dstack_releases_url }}" target="_blank" rel="noopener noreferrer">dstack releases ↗</a>.
+    </p>
+    <div class="kv">
+      {% match cvm.os_version %}
+        {% when Some with (v) %}<div class="row"><span class="k">os_version</span><span class="v">{{ v }}</span></div>
+        {% when None %}
+      {% endmatch %}
+      {% match cvm.os_image_hash %}{% when Some with (h) %}<div class="row"><span class="k">os_image_hash</span><span class="v">{{ h }}</span></div>{% when None %}{% endmatch %}
+      {% match cvm.mr_aggregated %}{% when Some with (h) %}<div class="row"><span class="k">mr_aggregated</span><span class="v">{{ h }}</span></div>{% when None %}{% endmatch %}
+      {% match cvm.compose_hash %}{% when Some with (h) %}<div class="row"><span class="k">compose_hash</span><span class="v">{{ h }}</span></div>{% when None %}{% endmatch %}
+    </div>
+  </div>
+
+  {# ===================== 6. KMS — deploy-time key provisioning ===================== #}
+  <div class="sec">
+    <div class="sec-head">
+      <span class="num">6</span>
+      <h3>KMS — deploy-time key provisioning</h3>
+    </div>
+    <p class="sec-note">
+      <strong>Deploy-time only.</strong> Governed by an on-chain contract, the dstack KMS releases this
+      CVM's keys at boot <em>only</em> if its measurements are approved — those keys decrypt the
+      deployment env file (so secrets never enter the measured compose) and provision the CVM's RA-TLS
+      identity + disk encryption. This secures how the worker is <em>deployed</em>; it does
+      <strong>not</strong> hold OutLayer's application or user secrets — those run through the OutLayer
+      keystore (master derived in-TEE via MPC), not the dstack KMS.
+    </p>
+    <div class="kv">
+      <div class="row">
+        <span class="k">key_provider</span>
+        <span class="v">{% match cvm.key_provider %}{% when Some with (k) %}{{ k }}{% when None %}unknown{% endmatch %}</span>
+      </div>
+    </div>
+  </div>
+
+</article>
+{% endfor %}
+
+<footer class="site">
+  Quotes are verified server-side against Intel's PCS collateral (Intel DCAP signature chain — not
+  Intel Trust Authority) and cross-checked against on-chain approved measurements. See the source for
+  the verification pipeline.
+</footer>
+{% endblock %}

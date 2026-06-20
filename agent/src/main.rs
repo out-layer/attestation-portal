@@ -158,8 +158,10 @@ async fn collect_vm(state: &AppState, vm: &VmStatus) -> CvmAttestation {
         device_id: None,
         mr_aggregated: None,
         os_image_hash: None,
+        os_version: None,
         measurements: None,
         image_digests: Vec::new(),
+        app_compose: None,
         key_provider: None,
         app_cert_pem: None,
         event_log: Vec::new(),
@@ -189,6 +191,7 @@ fn apply_info(cvm: &mut CvmAttestation, state: &AppState, info: AppInfo) {
     cvm.device_id = info.device_id;
     cvm.mr_aggregated = info.mr_aggregated;
     cvm.os_image_hash = info.os_image_hash;
+    cvm.os_version = parse_os_version(info.vm_config.as_deref());
     cvm.app_cert_pem = info.app_cert;
     cvm.key_provider = parse_key_provider(info.key_provider_info.as_deref());
 
@@ -215,6 +218,9 @@ fn apply_info(cvm: &mut CvmAttestation, state: &AppState, info: AppInfo) {
             if let Some(compose) = tcb.app_compose.as_deref() {
                 cvm.image_digests = extract_digests(compose, &state.image_re);
             }
+            // Forward the raw app-compose verbatim so the portal can render the measured source
+            // identity (Phala's "Compose File"). It is public attestation data; the portal escapes it.
+            cvm.app_compose = tcb.app_compose;
         }
         Err(e) => cvm.error = Some(format!("parse tcb_info: {e}")),
     }
@@ -282,6 +288,17 @@ fn extract_digests(compose: &str, re: &Regex) -> Vec<String> {
 fn parse_key_provider(s: Option<&str>) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(s?).ok()?;
     v.get("name").and_then(|n| n.as_str()).map(str::to_string)
+}
+
+/// `vm_config` is a JSON string carrying (among other fields) the dstack guest OS image tag under
+/// `image`, e.g. `"image":"dstack-0.5.11"`. Return it as the per-CVM dynamic OS version. Fail-soft:
+/// any parse miss → `None` (the portal then falls back to `os_image_hash` as the OS identity).
+fn parse_os_version(s: Option<&str>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(s?).ok()?;
+    v.get("image")
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn non_empty(s: Option<String>) -> Option<String> {
@@ -363,6 +380,10 @@ struct AppInfo {
     key_provider_info: Option<String>,
     #[serde(default)]
     compose_hash: Option<String>,
+    /// JSON string of the vmm's vm_config (cpu/mem/qemu_version/`image` OS tag …). We parse `image`
+    /// out of it for the per-CVM dstack OS version.
+    #[serde(default)]
+    vm_config: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -37,10 +37,19 @@ pub struct CvmAttestation {
     pub device_id: Option<String>,
     pub mr_aggregated: Option<String>,
     pub os_image_hash: Option<String>,
+    /// dstack guest OS image tag, parsed from the guest-agent `Info.vm_config.image` (e.g.
+    /// `dstack-0.5.11`) — the real, per-CVM dynamic OS version. `None` on older agents that don't
+    /// forward it (the page then falls back to `os_image_hash` as the precise OS identity).
+    pub os_version: Option<String>,
     /// The 5 TDX registers (96 hex chars each). Absent if the guest-agent was unreachable.
     pub measurements: Option<Measurements>,
     /// Docker image refs (`repo@sha256:…`) parsed from the measured app-compose.
     pub image_digests: Vec<String>,
+    /// The raw app-compose JSON (`tcb_info.app_compose`): docker_compose_file, allowed_envs,
+    /// pre_launch_script, features, gateway_enabled, kms_enabled. This is the measured source
+    /// identity ("Compose File" in Phala's explorer). `None` until the agent is redeployed (older
+    /// reports omit it). Rendered server-side, auto-escaped — never trusted as markup.
+    pub app_compose: Option<String>,
     /// `kms` or `local-sgx`.
     pub key_provider: Option<String>,
     /// RA-TLS cert PEM; the TDX quote is embedded as an X.509 extension (the server extracts +

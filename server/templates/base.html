@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+{# Page shell. All CSS is inline — no external/CDN assets, so the page is fully self-contained
+   behind nginx with no static files to serve (SECURITY.md: minimal surface, no JS). #}
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>OutLayer — TEE Attestation</title>
+  <style>
+    :root {
+      --bg: #0c0f14;
+      --panel: #141922;
+      --panel-2: #1b212c;
+      --border: #283142;
+      --fg: #e6e9ef;
+      --muted: #8b95a7;
+      --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      --good: #3fb950;
+      --good-bg: #11341b;
+      --bad: #f85149;
+      --bad-bg: #3a1413;
+      --warn: #d29922;
+      --warn-bg: #3a2d10;
+      --na: #6b7280;
+      --na-bg: #20252f;
+      --accent: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 15px/1.55 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    a { color: var(--accent); }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 32px 20px 80px; }
+    header.site h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: .2px; }
+    header.site .tagline { color: var(--muted); margin: 0; }
+    .intro {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 18px;
+      margin: 22px 0 30px;
+      color: var(--muted);
+    }
+    .intro strong { color: var(--fg); }
+    .node { margin: 30px 0; }
+    .node-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .node-head h2 {
+      font-size: 17px;
+      margin: 0;
+      font-family: var(--mono);
+    }
+    .pill {
+      font-size: 12px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+    }
+    .pill-live { color: var(--good); background: var(--good-bg); border-color: #1c5a2b; }
+    .pill-stale { color: var(--warn); background: var(--warn-bg); border-color: #5c4712; }
+    .pill-dead { color: var(--bad); background: var(--bad-bg); border-color: #5c2220; }
+
+    /* Index list — compact, clickable rows (one per CVM). */
+    ul.rows { list-style: none; margin: 0; padding: 0; }
+    .row-item { margin: 8px 0; }
+    .row-link {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      text-decoration: none;
+      color: var(--fg);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 16px;
+    }
+    .row-link:hover { border-color: var(--accent); background: var(--panel-2); }
+    .row-name { font-family: var(--mono); font-weight: 600; }
+    .row-status { color: var(--muted); font-size: 13px; }
+    /* Instance-count chip — shown only when an app has >1 running instance. */
+    .count {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--accent);
+      white-space: nowrap;
+    }
+    .row-chevron { margin-left: auto; color: var(--muted); font-size: 18px; }
+    /* Compact, one-glance verdict summary chip. */
+    .sum {
+      font-size: 12px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .sum-verified { color: var(--good); background: var(--good-bg); border-color: #1c5a2b; }
+    .sum-failed { color: var(--bad); background: var(--bad-bg); border-color: #5c2220; }
+    .sum-pending { color: var(--accent); background: #122031; border-color: #1d3a5c; }
+
+    /* Detail page — back-link + app-id in the header. */
+    .backlink { margin: 0 0 8px; font-size: 13px; }
+    .app-id-head { font-family: var(--mono); color: var(--fg); word-break: break-all; }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 18px;
+      margin: 16px 0;
+    }
+    .card.failing { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad) inset; }
+    .card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .card-head .name { font-family: var(--mono); font-weight: 600; }
+
+    /* Per-CVM "verified aspect" sections (vertical stack). */
+    .sec {
+      border-top: 1px solid var(--border);
+      margin-top: 16px;
+      padding-top: 14px;
+    }
+    .sec-head {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .sec-head .num {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--accent);
+      flex: 0 0 auto;
+    }
+    .sec-head h3 {
+      font-size: 14px;
+      margin: 0;
+      letter-spacing: .2px;
+    }
+    .sec-note { color: var(--muted); font-size: 13px; margin: 2px 0 8px; }
+    .sec.core.failing {
+      border-top-color: var(--bad);
+      background: var(--bad-bg);
+      margin-left: -18px;
+      margin-right: -18px;
+      padding-left: 18px;
+      padding-right: 18px;
+    }
+    .muted-line { color: var(--muted); font-size: 13px; }
+    .app-meta { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; }
+    .app-meta .m { font-size: 13px; color: var(--muted); }
+    .app-meta .m b { color: var(--fg); font-weight: 600; font-family: var(--mono); }
+    pre.quote {
+      margin: 10px 0 0;
+      padding: 10px 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      line-height: 1.4;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 240px;
+      overflow: auto;
+      user-select: all;
+    }
+    .badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .4px;
+    }
+    .status { margin-left: auto; color: var(--muted); font-size: 13px; }
+
+    .verdicts { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 4px; }
+    .vb {
+      font-size: 12px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: var(--na-bg);
+      color: var(--na);
+      white-space: nowrap;
+    }
+    .vb.good { color: var(--good); background: var(--good-bg); border-color: #1c5a2b; }
+    .vb.bad { color: var(--bad); background: var(--bad-bg); border-color: #5c2220; }
+    .vb.warn { color: var(--warn); background: var(--warn-bg); border-color: #5c4712; }
+    .vb.na { color: var(--na); background: var(--na-bg); }
+    .vb.pending { color: var(--accent); background: #122031; border-color: #1d3a5c; }
+    .vb .sub { font-weight: 400; opacity: .8; }
+
+    .details { margin-top: 14px; }
+    .details summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 13px;
+      user-select: none;
+    }
+    .kv { margin: 12px 0 0; }
+    .kv .row { display: flex; gap: 12px; padding: 3px 0; align-items: baseline; }
+    .kv .k {
+      flex: 0 0 130px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .kv .v {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      word-break: break-all;
+      color: var(--fg);
+    }
+    .kv .v.list { display: flex; flex-direction: column; gap: 2px; }
+    .err {
+      margin-top: 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: var(--bad-bg);
+      border: 1px solid #5c2220;
+      color: #ffb4af;
+      font-size: 13px;
+      word-break: break-word;
+    }
+    .verify-link { display: inline-block; margin-top: 12px; font-size: 13px; }
+
+    /* Source-Code image table (Container | Image | Digest | Verify). */
+    table.imgs {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 10px 0 6px;
+      font-size: 12.5px;
+    }
+    table.imgs th, table.imgs td {
+      text-align: left;
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    table.imgs thead th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      border-bottom: 1px solid var(--border);
+    }
+    table.imgs td { color: var(--fg); }
+    table.imgs td.img-ref {
+      font-family: var(--mono);
+      word-break: break-all;
+    }
+    table.imgs td.img-ref .origin {
+      display: block;
+      margin-top: 2px;
+      font-family: system-ui, sans-serif;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    table.imgs td.digest {
+      font-family: var(--mono);
+      color: var(--muted);
+      word-break: break-all;
+      max-width: 320px;
+    }
+    table.imgs td.verify { white-space: nowrap; }
+    table.imgs td.verify a { display: inline-block; margin-right: 10px; }
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 60px 20px;
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      margin-top: 30px;
+    }
+    footer.site { margin-top: 50px; color: var(--muted); font-size: 12.5px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

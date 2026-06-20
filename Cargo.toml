@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["shared", "agent", "server"]
-# web/askama page + dcap-qvl verification + /admin land in following phases (see server/ + SECURITY.md).
+# /admin lands in a following phase (see server/ + SECURITY.md). dcap-qvl verification (Phase 2) and
+# the askama public page (Phase 3) are in `server/`.
 
 [workspace.package]
 edition = "2021"
@@ -18,3 +19,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Phase 2 quote verification: Intel DCAP QVL (TDX), leaf-cert quote extraction, and base64 for NEAR RPC args.
+# dcap-qvl uses its own internal reqwest (kept off its public API), so it coexists with our reqwest above.
+dcap-qvl = "0.5.2"
+x509-parser = "0.18"
+base64 = "0.22"
+# Phase 3 public HTML page: compiled, auto-escaping (XSS-safe) templates. We render to a String and
+# wrap in axum::response::Html ourselves — NO askama_axum — to keep the dependency surface minimal
+# (SECURITY.md req 6). default-features off drops mime_guess/humansize/percent-encoding/config we
+# don't use; HTML auto-escape is the built-in default escaper and stays on without any feature.
+askama = { version = "0.12", default-features = false }

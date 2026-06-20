@@ -12,5 +12,13 @@ serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 axum.workspace = true
+reqwest.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Phase 2: TDX quote verification + on-chain measurement cross-check (see verify.rs / SECURITY.md).
+dcap-qvl.workspace = true
+x509-parser.workspace = true
+base64.workspace = true
+# Phase 3: the public HTML attestation page. Compiled templates auto-escape every data field — the
+# page renders names/ids/hashes that ultimately arrive over the wire, so escaping is our XSS defense.
+askama.workspace = true

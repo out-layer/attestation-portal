@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{# Friendly "unknown app id" page (served with HTTP 404 by the handler). Tiny body + a link back to
+   the worker list. The unknown `app_id` is echoed back, auto-escaped — NO `|safe`. #}
+
+{% block content %}
+<header class="site">
+  <h1>OutLayer — TEE Attestation</h1>
+</header>
+
+<div class="empty">
+  <p>No worker found for app id <strong>{{ app_id }}</strong>.</p>
+  <p>It may have stopped reporting, or the link is stale.</p>
+  <p><a href="/">← back to all workers</a></p>
+</div>
+{% endblock %}
