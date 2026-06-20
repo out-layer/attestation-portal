@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
         node_id: env_or("NODE_ID", &hostname()),
         portal_url: std::env::var("PORTAL_INGEST_URL").ok().filter(|s| !s.is_empty()),
         push_token: std::env::var("PUSH_TOKEN").ok().filter(|s| !s.is_empty()),
-        push_interval: env_or("PUSH_INTERVAL_SECS", "30").parse().unwrap_or(30),
+        push_interval: env_or("PUSH_INTERVAL_SECS", "300").parse().unwrap_or(300),
     };
     tracing::info!(
         vmm_rpc = %cfg.vmm_rpc, bind = %cfg.bind, node_id = %cfg.node_id,
@@ -149,6 +149,7 @@ async fn collect_vm(state: &AppState, vm: &VmStatus) -> CvmAttestation {
         vm_id: vm.id.clone(),
         name: vm.name.clone(),
         role: Role::from_name(&vm.name),
+        network: attestation_shared::network_from_name(&vm.name),
         status: vm.status.clone(),
         uptime: vm.uptime.clone(),
         app_id: vm.app_id.clone(),

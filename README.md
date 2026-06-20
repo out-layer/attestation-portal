@@ -45,16 +45,24 @@ A compromise of the portal yields only public attestation data + the ability to 
 agent (on a TDX host, as the vmm-owning user — needs to read `/proc/<pid>/cmdline` of the qemu CVMs):
 ```bash
 VMM_RPC=http://127.0.0.1:11000 NODE_ID=node-tdx-dal-2 \
-  PORTAL_INGEST_URL=https://workers.outlayer.ai/ingest PUSH_TOKEN=<token> PUSH_INTERVAL_SECS=30 \
+  PORTAL_INGEST_URL=https://workers.outlayer.ai/ingest PUSH_TOKEN=<token> PUSH_INTERVAL_SECS=300 \
   AGENT_BIND=127.0.0.1:9300 \
   cargo run -p attestation-agent
 # local debug (loopback): curl -s http://127.0.0.1:9300/attestation | jq
 ```
 
-server (next to the coordinator; fronted by a CF Tunnel for `workers.outlayer.ai`):
+The agent re-pushes every `PUSH_INTERVAL_SECS` (default 300s = 5 min). Attestation is near-static, so
+the interval exists mainly as a **liveness signal** — the page shows "last seen live N minutes ago".
+
+server (next to the coordinator; nginx vhost for `workers.outlayer.ai` → this loopback bind):
 ```bash
-SERVER_BIND=127.0.0.1:8088 INGEST_TOKEN=<same token> cargo run -p attestation-server
+SERVER_BIND=127.0.0.1:8088 INGEST_TOKEN=<same token> \
+  STATE_FILE=/var/lib/attestation-portal/state.json \
+  cargo run -p attestation-server
 curl -s http://127.0.0.1:8088/api/attestation | jq
 ```
+
+`STATE_FILE` (optional) mirrors the latest reports to disk on every ingest and reloads them on
+startup, so a server restart restores the last-known attestation immediately. No DB.
 
 Design + data-source reference: `~/.claude/plans/outlayer-attestation-page-design.md`.

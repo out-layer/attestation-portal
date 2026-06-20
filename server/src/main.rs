@@ -1,12 +1,17 @@
-//! attestation-portal server — receives pushed node reports + serves them (+ later: verify, page, /admin).
+//! attestation-portal server — receives pushed node reports + serves them (+ later: verify, page).
 //!
 //! PUSH model (../SECURITY.md): each per-node `agent` makes an OUTBOUND, bearer-authed POST to
-//! `/ingest`. The server NEVER reaches into a TDX node — there is no fan-out, no SSRF surface, and no
-//! node credential here. It stores the latest report per `node_id` in memory and serves them
-//! read-only at `/api/attestation`. `/ingest` fails CLOSED when no token is configured.
+//! `/ingest`. The server NEVER reaches into a TDX node — no fan-out, no SSRF surface, no node
+//! credential here. It keeps the latest report per `node_id` in memory and serves them read-only at
+//! `/api/attestation`. `/ingest` fails CLOSED when no token is configured.
+//!
+//! Durability: the latest map is mirrored to a JSON file (`STATE_FILE`) on every ingest and loaded on
+//! startup, so a server restart restores the last-known attestation immediately instead of showing a
+//! blank page until agents re-push. (No DB — the data is small + self-refreshing; SQLite only if we
+//! later want full history.)
 //!
 //! Following phases (to SECURITY.md): dcap-qvl quote verification + on-chain `is_measurements_approved`
-//! cross-check; the askama public HTML page; and a SEPARATE, authed (CF Access), READ-ONLY `/admin`.
+//! cross-check; the askama public HTML page.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,17 +25,19 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 struct Config {
     bind: String,
     /// Bearer token required on `/ingest`. None → ingest disabled (fail closed).
     ingest_token: Option<String>,
+    /// Path to persist the latest-report map (JSON). None → in-memory only.
+    state_file: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct StoredReport {
-    /// Unix seconds the portal received this push.
+    /// Unix seconds the portal received this push (drives the "last seen live" freshness signal).
     received_at: u64,
     report: NodeReport,
 }
@@ -56,15 +63,21 @@ async fn main() -> Result<()> {
     let cfg = Config {
         bind: env_or("SERVER_BIND", "127.0.0.1:8088"),
         ingest_token: std::env::var("INGEST_TOKEN").ok().filter(|s| !s.is_empty()),
+        state_file: std::env::var("STATE_FILE").ok().filter(|s| !s.is_empty()),
     };
     if cfg.ingest_token.is_none() {
         tracing::warn!("INGEST_TOKEN unset — /ingest is DISABLED (fail closed). Set it to accept agent pushes.");
     }
-    tracing::info!(bind = %cfg.bind, ingest = cfg.ingest_token.is_some(), "starting attestation-portal server");
+    let initial = cfg.state_file.as_deref().map(load_state).unwrap_or_default();
+    tracing::info!(
+        bind = %cfg.bind, ingest = cfg.ingest_token.is_some(),
+        state_file = cfg.state_file.is_some(), restored = initial.len(),
+        "starting attestation-portal server"
+    );
 
     let state = Arc::new(AppState {
         cfg,
-        reports: Mutex::new(HashMap::new()),
+        reports: Mutex::new(initial),
     });
 
     let app = Router::new()
@@ -102,8 +115,16 @@ async fn ingest(State(state): State<Arc<AppState>>, headers: HeaderMap, body: By
         received_at: now_secs(),
         report,
     };
-    if let Ok(mut map) = state.reports.lock() {
-        map.insert(node_id.clone(), stored);
+    // Update the map and, if persisting, snapshot it WITHOUT holding the lock across file IO.
+    let snapshot = match state.reports.lock() {
+        Ok(mut map) => {
+            map.insert(node_id.clone(), stored);
+            state.cfg.state_file.as_ref().map(|_| map.clone())
+        }
+        Err(_) => None,
+    };
+    if let (Some(path), Some(snap)) = (state.cfg.state_file.as_deref(), snapshot) {
+        save_state(path, &snap);
     }
     tracing::info!(node = %node_id, "ingested report");
     StatusCode::OK
@@ -144,6 +165,29 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Load the persisted map on startup; missing/corrupt file → start empty (non-fatal).
+fn load_state(path: &str) -> HashMap<String, StoredReport> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!("state file {path} unreadable ({e}) — starting empty");
+            HashMap::new()
+        }),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Atomically persist the map (write tmp + rename) so a crash mid-write can't corrupt it.
+fn save_state(path: &str, map: &HashMap<String, StoredReport>) {
+    let tmp = format!("{path}.tmp");
+    let ok = serde_json::to_vec(map)
+        .map_err(|e| anyhow::anyhow!("serialize: {e}"))
+        .and_then(|bytes| std::fs::write(&tmp, bytes).map_err(Into::into))
+        .and_then(|_| std::fs::rename(&tmp, path).map_err(Into::into));
+    if let Err(e) = ok {
+        tracing::warn!("failed to persist state to {path}: {e:#}");
+    }
 }
 
 fn now_secs() -> u64 {

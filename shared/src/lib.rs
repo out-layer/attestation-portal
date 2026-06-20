@@ -24,6 +24,9 @@ pub struct CvmAttestation {
     /// vmm VM label (`kms`, `dstack-gateway`, `testnet-keystore-…`, `…-worker-…`).
     pub name: String,
     pub role: Role,
+    /// `testnet` / `mainnet` derived from the VM name; `None` for net-agnostic CVMs (kms, gateway).
+    /// The server uses it to pick the right on-chain contracts for the measurement cross-check.
+    pub network: Option<String>,
     /// vmm status string (`running`, `exited`, …).
     pub status: String,
     pub uptime: Option<String>,
@@ -81,6 +84,18 @@ pub enum Role {
     Keystore,
     Worker,
     Unknown,
+}
+
+/// Derive `testnet` / `mainnet` from a VM label, or `None` for net-agnostic CVMs (kms, gateway).
+pub fn network_from_name(name: &str) -> Option<String> {
+    let n = name.to_ascii_lowercase();
+    if n.contains("testnet") {
+        Some("testnet".to_string())
+    } else if n.contains("mainnet") {
+        Some("mainnet".to_string())
+    } else {
+        None
+    }
 }
 
 impl Role {
