@@ -887,6 +887,22 @@ impl UnknownAppPage {
     }
 }
 
+/// The friendly "no keystore for this network" page (served with HTTP 404 by the stable
+/// `/<network>-keystore` redirect handler when no keystore CVM for that network is currently
+/// reporting — e.g. the mainnet keystore isn't deployed yet). A tiny body + a link back to `/` —
+/// never a panic/500. The `network` is echoed back, auto-escaped (no `|safe`).
+#[derive(Template)]
+#[template(path = "no_keystore.html")]
+pub struct NoKeystorePage {
+    pub network: String,
+}
+
+impl NoKeystorePage {
+    pub fn render_page(&self) -> Result<String, askama::Error> {
+        self.render()
+    }
+}
+
 /// One stored node's renderable parts: when the portal received it, the report, and its per-CVM
 /// verdicts. This is exactly what `main.rs`'s `StoredReport` carries (and what an offline render —
 /// e.g. `examples/render_preview.rs` — assembles), borrowed so the caller keeps ownership.
@@ -956,6 +972,12 @@ pub fn render_app(
 /// Render the friendly "unknown app id" body (paired with HTTP 404 at the handler). Never `None`.
 pub fn render_unknown_app(app_id: &str) -> Result<String, askama::Error> {
     UnknownAppPage { app_id: app_id.to_string() }.render_page()
+}
+
+/// Render the friendly "no keystore for this network" body (paired with HTTP 404 at the stable
+/// `/<network>-keystore` redirect handler when no keystore CVM for `network` is reporting).
+pub fn render_no_keystore(network: &str) -> Result<String, askama::Error> {
+    NoKeystorePage { network: network.to_string() }.render_page()
 }
 
 #[cfg(test)]

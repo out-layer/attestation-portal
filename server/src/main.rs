@@ -20,12 +20,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use attestation_shared::NodeReport;
+use attestation_shared::{NodeReport, Role};
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
-    response::Html,
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -96,6 +96,18 @@ async fn main() -> Result<()> {
         .route("/", get(index))
         // Per-app DETAIL page: the full sectioned "verified aspects" view for one app_id.
         .route("/app/:app_id", get(app_detail))
+        // Stable per-network keystore links: resolve the CURRENT keystore CVM for that network from
+        // stored reports and redirect to its `/app/<app_id>` detail page. Lets the dashboard link to
+        // a fixed URL without knowing the (rotating) app_id. The network is bound per-route here, so
+        // no path param is request-derived (no SSRF surface — `network` is a hard-coded literal).
+        .route(
+            "/testnet-keystore",
+            get(|state: State<Arc<AppState>>| async move { keystore_redirect(state.0, "testnet") }),
+        )
+        .route(
+            "/mainnet-keystore",
+            get(|state: State<Arc<AppState>>| async move { keystore_redirect(state.0, "mainnet") }),
+        )
         // 256 KiB is ample for a node report; bound it so an unauth body can't grow memory.
         .route("/ingest", post(ingest).layer(DefaultBodyLimit::max(256 * 1024)))
         .route("/api/attestation", get(api_attestation))
@@ -239,6 +251,65 @@ async fn app_detail(
     }
 }
 
+/// Stable per-network keystore redirect (`GET /testnet-keystore` | `/mainnet-keystore`): resolve the
+/// CURRENT keystore CVM for `network` from stored reports and 303-redirect to its `/app/<app_id>`
+/// detail page (there is exactly one keystore per network). This gives the dashboard a fixed URL that
+/// survives keystore redeploys (the `app_id` rotates with each compose change).
+///
+/// Lock discipline (matches the rest of the file): take the std Mutex only to find + CLONE the one
+/// `app_id`, then release it — no await / heavy work while locked. Never panics on a wire value and
+/// reads only already-public attestation data; a poisoned lock degrades to the friendly 404.
+///
+/// If no such keystore is currently reporting (e.g. the mainnet keystore isn't deployed yet) → a
+/// small, auto-escaped HTML page (the not-found style) with `404 Not Found`, never a redirect to a
+/// dead page and never a panic.
+fn keystore_redirect(state: Arc<AppState>, network: &str) -> Response {
+    let app_id = match state.reports.lock() {
+        Ok(map) => find_keystore_app_id(map.values(), network),
+        Err(_) => None, // poisoned lock → behave as "not found" (the page is still up)
+    };
+
+    match app_id {
+        Some(app_id) if !app_id.is_empty() => {
+            // Relative path; `Redirect::to` emits a 303 See Other to `/app/<app_id>`.
+            Redirect::to(&format!("/app/{app_id}")).into_response()
+        }
+        // No keystore for this network (or a degraded report with an empty app_id) — friendly 404.
+        _ => {
+            let body = page::render_no_keystore(network).unwrap_or_else(|e| {
+                tracing::error!("no-keystore render failed: {e}");
+                "<!doctype html><title>OutLayer</title><p>no keystore is currently reporting. \
+                 <a href=\"/\">back</a></p>"
+                    .to_string()
+            });
+            (StatusCode::NOT_FOUND, Html(body)).into_response()
+        }
+    }
+}
+
+/// Find the `app_id` of the keystore CVM for `network` across all stored reports: the first CVM with
+/// `role == Role::Keystore` and `network` matching (there is exactly one keystore per network). If
+/// several match — which shouldn't happen — prefer the one from the most-recently-received report so
+/// the link follows the freshest deployment. Pure + borrow-only; no IO, no panics.
+fn find_keystore_app_id<'a>(
+    reports: impl IntoIterator<Item = &'a StoredReport>,
+    network: &str,
+) -> Option<String> {
+    reports
+        .into_iter()
+        .flat_map(|stored| {
+            stored
+                .report
+                .cvms
+                .iter()
+                .filter(|c| c.role == Role::Keystore && c.network.as_deref() == Some(network))
+                .map(move |c| (stored.received_at, c.app_id.clone()))
+        })
+        // Most-recently-received report wins if more than one keystore matches (shouldn't happen).
+        .max_by_key(|(received_at, _)| *received_at)
+        .map(|(_, app_id)| app_id)
+}
+
 /// Take the std Mutex only to CLONE the stored reports (sorted by node_id for a stable page order),
 /// then release it. A poisoned lock must not take the public page down — return empty. No await /
 /// heavy work is done while the lock is held (the caller renders afterward).
@@ -330,4 +401,156 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attestation_shared::CvmAttestation;
+
+    /// Build a keystore CVM for `network` with the given `app_id`. Only the fields the keystore
+    /// redirect lookup reads (`role`, `network`, `app_id`) matter; the rest are benign defaults.
+    fn keystore_cvm(network: &str, app_id: &str) -> CvmAttestation {
+        CvmAttestation {
+            vm_id: format!("vm-{app_id}"),
+            name: format!("{network}-keystore"),
+            role: Role::Keystore,
+            network: Some(network.to_string()),
+            status: "running".to_string(),
+            uptime: None,
+            app_id: app_id.to_string(),
+            instance_id: None,
+            compose_hash: None,
+            device_id: None,
+            mr_aggregated: None,
+            os_image_hash: None,
+            os_version: None,
+            measurements: None,
+            image_digests: Vec::new(),
+            app_compose: None,
+            key_provider: None,
+            app_cert_pem: None,
+            event_log: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// A non-keystore (worker) CVM that must NOT be picked up by the keystore lookup, even on the
+    /// same network.
+    fn worker_cvm(network: &str, app_id: &str) -> CvmAttestation {
+        CvmAttestation {
+            role: Role::Worker,
+            name: format!("{network}-worker"),
+            ..keystore_cvm(network, app_id)
+        }
+    }
+
+    fn stored_report(received_at: u64, cvms: Vec<CvmAttestation>) -> StoredReport {
+        StoredReport {
+            received_at,
+            report: NodeReport {
+                node_id: format!("node-{received_at}"),
+                collected_at: received_at,
+                cvms,
+            },
+            verdicts: Vec::new(),
+        }
+    }
+
+    /// Build an `AppState` carrying the given stored reports (keyed by node_id), no ingest token / no
+    /// state file — enough to drive the read-only keystore redirect handler in-process.
+    fn state_with(reports: Vec<StoredReport>) -> Arc<AppState> {
+        let mut map: HashMap<String, StoredReport> = HashMap::new();
+        for r in reports {
+            map.insert(r.report.node_id.clone(), r);
+        }
+        Arc::new(AppState {
+            cfg: Config { bind: "127.0.0.1:0".to_string(), ingest_token: None, state_file: None },
+            reports: Mutex::new(map),
+        })
+    }
+
+    /// A stored report whose keystore CVM is testnet → the testnet redirect lands on its `/app/...`.
+    #[test]
+    fn testnet_keystore_redirects_to_app_detail() {
+        let state = state_with(vec![stored_report(10, vec![keystore_cvm("testnet", "abc123")])]);
+        let resp = keystore_redirect(state, "testnet");
+
+        // 303 See Other (axum `Redirect::to`), Location pointing at the keystore's detail page.
+        assert!(
+            resp.status().is_redirection(),
+            "expected a 3xx redirect, got {}",
+            resp.status()
+        );
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("location header present");
+        assert_eq!(location, "/app/abc123");
+    }
+
+    /// No testnet keystore reporting → 404 with the friendly body, never a panic, no Location.
+    #[test]
+    fn missing_testnet_keystore_yields_friendly_404() {
+        // A worker on testnet + a keystore on the OTHER network — neither should match testnet.
+        let state = state_with(vec![stored_report(
+            10,
+            vec![worker_cvm("testnet", "wkr1"), keystore_cvm("mainnet", "main1")],
+        )]);
+        let resp = keystore_redirect(state, "testnet");
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            resp.headers().get(axum::http::header::LOCATION).is_none(),
+            "a 404 must not carry a redirect Location"
+        );
+    }
+
+    /// Each network resolves its OWN keystore independently, even when both are reporting together.
+    #[test]
+    fn mainnet_and_testnet_resolve_independently() {
+        let state = state_with(vec![stored_report(
+            10,
+            vec![keystore_cvm("testnet", "tnet1"), keystore_cvm("mainnet", "mnet1")],
+        )]);
+
+        let testnet = keystore_redirect(state.clone(), "testnet");
+        assert_eq!(testnet.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            testnet.headers().get(axum::http::header::LOCATION).unwrap(),
+            "/app/tnet1"
+        );
+
+        let mainnet = keystore_redirect(state, "mainnet");
+        assert_eq!(mainnet.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            mainnet.headers().get(axum::http::header::LOCATION).unwrap(),
+            "/app/mnet1"
+        );
+    }
+
+    /// The pure lookup ignores non-keystore roles and wrong networks, and — should two keystores ever
+    /// match — prefers the one from the most-recently-received report.
+    #[test]
+    fn find_keystore_app_id_filters_and_prefers_newest() {
+        // A worker on testnet must be ignored even though it's the same network.
+        let only_worker = [stored_report(10, vec![worker_cvm("testnet", "wkr")])];
+        assert_eq!(find_keystore_app_id(only_worker.iter(), "testnet"), None);
+
+        // Two testnet keystores (shouldn't happen) across two reports → newest received wins.
+        let dup = [
+            stored_report(10, vec![keystore_cvm("testnet", "old")]),
+            stored_report(20, vec![keystore_cvm("testnet", "new")]),
+        ];
+        assert_eq!(
+            find_keystore_app_id(dup.iter(), "testnet"),
+            Some("new".to_string())
+        );
+
+        // A mainnet keystore does not satisfy a testnet lookup.
+        let other_net = [stored_report(10, vec![keystore_cvm("mainnet", "m")])];
+        assert_eq!(find_keystore_app_id(other_net.iter(), "testnet"), None);
+    }
 }
