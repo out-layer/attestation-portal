@@ -1,14 +1,16 @@
 {% extends "base.html" %}
 
-{# Public attestation INDEX — the compact LIST. One row per APP (grouped by `app_id`), not per
-   running instance: multiple instances (e.g. two worker instances) share one `app_id` and collapse
-   to a single row. Every `{{ }}` is auto-escaped by askama — NO `|safe` anywhere, because names /
-   ids / hashes arrive over the wire (defense-in-depth against XSS).
+{# Public attestation INDEX — ONE flat, location-agnostic LIST. One row per APP, grouped GLOBALLY by
+   `app_id` across ALL nodes (not per running instance, not per node): instances sharing an `app_id`
+   — even across different hosts — collapse to a single row whose count folds them all. NO node
+   headers / node_id / location, and NO per-node freshness pill (the "last push" moved to the
+   per-instance detail card). Every `{{ }}` is auto-escaped by askama — NO `|safe` anywhere, because
+   names / ids / hashes arrive over the wire (defense-in-depth against XSS).
 
    Each row links to `/app/<app_id>`, the per-CVM detail page with the full sectioned "verified
    aspects" view for EVERY instance. We keep this list intentionally light: display name, role/network
-   badges, an instance-count chip (only when >1), aggregate status, the freshness pill (node level),
-   and a single AGGREGATE verdict chip (✓ Verified / ✗ Check failed / verifying…). #}
+   badges, an instance-count chip (only when >1), aggregate status, and a single AGGREGATE verdict
+   chip (✓ Verified / ✗ Check failed / verifying…). #}
 
 {% block content %}
 <header class="site">
@@ -26,69 +28,62 @@
   <strong>Click a worker</strong> for the full breakdown.
 </div>
 
-{% if nodes.is_empty() %}
+{% if fleet.primary.is_empty() && fleet.infra.is_empty() %}
   <div class="empty">No nodes reporting yet. Attestation will appear here once an agent pushes a report.</div>
 {% else %}
-  {% for node in nodes %}
-  <section class="node">
-    <div class="node-head">
-      <h2>{{ node.node_id }}</h2>
-      <span class="pill pill-{{ node.last_seen_class }}">last push {{ node.last_seen_human }}</span>
-    </div>
+  {# Primary apps — the OutLayer-built, on-chain-approved WORKERS (worker/keystore), folded across
+     ALL nodes. Prominent, rendered FIRST. #}
+  {% if !fleet.primary.is_empty() %}
+  <ul class="rows">
+    {% for row in fleet.primary %}
+    <li class="row-item">
+      <a class="row-link" href="/app/{{ row.app_id }}">
+        <span class="row-name">{{ row.name }}</span>
+        <span class="badge">{{ row.role_label }}</span>
+        {% match row.network_label %}
+          {% when Some with (net) %}<span class="badge">{{ net }}</span>
+          {% when None %}
+        {% endmatch %}
+        {% if row.multi_instance %}
+        <span class="count" title="multiple running instances share this app_id">{{ row.instance_count }} instances</span>
+        {% endif %}
+        <span class="row-status">{{ row.status }}</span>
+        <span class="sum sum-{{ row.summary_class }}">{{ row.summary_label }}</span>
+        <span class="row-chevron" aria-hidden="true">›</span>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
 
-    {# Primary apps — the OutLayer-built, on-chain-approved WORKERS (worker/keystore). Prominent,
-       rendered FIRST. #}
-    <ul class="rows">
-      {% for row in node.primary %}
-      <li class="row-item">
-        <a class="row-link" href="/app/{{ row.app_id }}">
-          <span class="row-name">{{ row.name }}</span>
-          <span class="badge">{{ row.role_label }}</span>
-          {% match row.network_label %}
-            {% when Some with (net) %}<span class="badge">{{ net }}</span>
-            {% when None %}
-          {% endmatch %}
-          {% if row.multi_instance %}
-          <span class="count" title="multiple running instances share this app_id">{{ row.instance_count }} instances</span>
-          {% endif %}
-          <span class="row-status">{{ row.status }}</span>
-          <span class="sum sum-{{ row.summary_class }}">{{ row.summary_label }}</span>
-          <span class="row-chevron" aria-hidden="true">›</span>
-        </a>
-      </li>
-      {% endfor %}
-    </ul>
-
-    {# Supporting infrastructure — shared dstack TEE components (KMS, gateway, unknown). Attested,
-       but NOT OutLayer apps. Visually de-emphasized: a small subheading + a muted, compact row list.
-       Each row still links to /app/<app_id> so it stays inspectable — just downranked. Rendered
-       only when this node actually has infra CVMs. #}
-    {% if !node.infra.is_empty() %}
-    <div class="infra-head">Supporting infrastructure</div>
-    <p class="infra-note">Shared dstack TEE components (KMS, gateway) — attested, but not OutLayer apps.</p>
-    <ul class="rows infra">
-      {% for row in node.infra %}
-      <li class="row-item">
-        <a class="row-link" href="/app/{{ row.app_id }}">
-          <span class="infra-dot infra-{{ row.summary_class }}" title="{{ row.summary_label }}">●</span>
-          <span class="row-name">{{ row.name }}</span>
-          <span class="badge">{{ row.role_label }}</span>
-          {% match row.network_label %}
-            {% when Some with (net) %}<span class="badge">{{ net }}</span>
-            {% when None %}
-          {% endmatch %}
-          {% if row.multi_instance %}
-          <span class="count" title="multiple running instances share this app_id">{{ row.instance_count }} instances</span>
-          {% endif %}
-          <span class="row-status">{{ row.status }}</span>
-          <span class="row-chevron infra-chevron" aria-hidden="true">›</span>
-        </a>
-      </li>
-      {% endfor %}
-    </ul>
-    {% endif %}
-  </section>
-  {% endfor %}
+  {# Supporting infrastructure — shared dstack TEE components (KMS, gateway, unknown), folded across
+     ALL nodes. Attested, but NOT OutLayer apps. Visually de-emphasized: a small subheading + a muted,
+     compact row list. Each row still links to /app/<app_id> so it stays inspectable — just
+     downranked. Rendered only when the fleet actually has infra CVMs. #}
+  {% if !fleet.infra.is_empty() %}
+  <div class="infra-head">Supporting infrastructure</div>
+  <p class="infra-note">Shared dstack TEE components (KMS, gateway) — attested, but not OutLayer apps.</p>
+  <ul class="rows infra">
+    {% for row in fleet.infra %}
+    <li class="row-item">
+      <a class="row-link" href="/app/{{ row.app_id }}">
+        <span class="infra-dot infra-{{ row.summary_class }}" title="{{ row.summary_label }}">●</span>
+        <span class="row-name">{{ row.name }}</span>
+        <span class="badge">{{ row.role_label }}</span>
+        {% match row.network_label %}
+          {% when Some with (net) %}<span class="badge">{{ net }}</span>
+          {% when None %}
+        {% endmatch %}
+        {% if row.multi_instance %}
+        <span class="count" title="multiple running instances share this app_id">{{ row.instance_count }} instances</span>
+        {% endif %}
+        <span class="row-status">{{ row.status }}</span>
+        <span class="row-chevron infra-chevron" aria-hidden="true">›</span>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
 {% endif %}
 
 <footer class="site">

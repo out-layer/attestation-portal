@@ -47,8 +47,27 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// The agent takes NO positional args — it's configured entirely via env vars. Printed on `--help`
+/// or any accidental argument, so a probe can't silently start a real agent (which binds + pushes).
+fn print_usage() {
+    eprintln!(
+        "attestation-agent: read-only TDX fleet collector that pushes attestation to the portal.\n\
+         Takes no positional arguments; configure via environment variables: VMM_RPC \
+         (default http://127.0.0.1:11000), AGENT_BIND (default 127.0.0.1:9300), NODE_ID \
+         (default: hostname), PORTAL_INGEST_URL (unset = debug-only, no push), PUSH_TOKEN, \
+         PUSH_INTERVAL_SECS (default 300)."
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Configured entirely via env; reject stray args (e.g. `--help`) BEFORE starting anything so a
+    // probe can't accidentally launch a real agent that binds 9300 + pushes.
+    if std::env::args().len() > 1 {
+        let first = std::env::args().nth(1).unwrap_or_default();
+        print_usage();
+        std::process::exit(if matches!(first.as_str(), "-h" | "--help") { 0 } else { 2 });
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

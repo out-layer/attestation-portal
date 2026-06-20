@@ -6,12 +6,14 @@
 //! TDX TEE running the on-chain-approved code.
 //!
 //! Two-level UX (modeled on Phala's explorer):
-//!   * `render_index` — the LIST: one compact row per APP (grouped by `app_id`), not per running
-//!     instance — multiple instances (e.g. two worker instances) share one `app_id` and collapse to
-//!     a single row showing a display name, role/network badges, an instance count ("N instances"
-//!     when N>1), an aggregate status, and an AGGREGATE verdict chip (failing if ANY instance fails;
-//!     pending if ANY is pending; Verified only if ALL pass), grouped under their node_id header.
-//!     Each row links to `/app/<app_id>` (the detail page renders every instance).
+//!   * `render_index` — the LIST: ONE flat, location-agnostic list, one compact row per APP, grouped
+//!     GLOBALLY by `app_id` across ALL nodes (not per running instance, not per node) — multiple
+//!     instances (e.g. two worker instances, even on different hosts) share one `app_id` and collapse
+//!     to a single row showing a display name, role/network badges, an instance count ("N instances"
+//!     when N>1, folded across nodes), an aggregate status, and an AGGREGATE verdict chip (failing if
+//!     ANY instance fails; pending if ANY is pending; Verified only if ALL pass). No node_id / node
+//!     headers / per-node freshness pill — where a CVM runs is irrelevant on the index. Each row links
+//!     to `/app/<app_id>` (the detail page renders every instance, each with its own "last push").
 //!   * `render_app` — the DETAIL: the full per-CVM stack of "verified aspect" sections (App header,
 //!     TDX Hardware Attestation, Source Code/compose, Zero Trust Gateway, App OS, KMS/Root-of-Trust)
 //!     for every CVM whose `app_id` matches — multiple running instances can share one app_id, so all
@@ -133,8 +135,10 @@ impl Summary {
     }
 }
 
-/// One node (one TDX host) as the INDEX list sees it: its header (id + freshness pill) plus the
-/// compact rows for its APPS, split into two groups. The page's purpose is to showcase the
+/// The whole fleet as ONE flat INDEX list — no per-node grouping, no node headers, no per-node
+/// freshness pill. Where a CVM physically runs is irrelevant on the index, so we collect EVERY app
+/// across ALL nodes and group GLOBALLY by `app_id` (one row per distinct `app_id`, instance count
+/// folded across nodes), then split into two groups. The page's purpose is to showcase the
 /// OutLayer-built WORKERS; the shared dstack TEE components (KMS, gateway) are supporting
 /// infrastructure shown below, visually de-emphasized.
 ///
@@ -144,11 +148,9 @@ impl Summary {
 ///   OutLayer apps — rendered in a muted, compact block UNDER the primary rows.
 ///
 /// Each row is a thin `AppRowView` (no decoded quote / sections) so the list stays light; the full
-/// per-CVM view (`CvmView`) is built only on the detail page.
-pub struct NodeListView {
-    pub node_id: String,
-    pub last_seen_human: String,
-    pub last_seen_class: &'static str,
+/// per-CVM view (`CvmView`) is built only on the detail page. The "last push" freshness moved to the
+/// detail page (per instance), so it is NOT carried here.
+pub struct FleetListView {
     /// OutLayer-built primary apps (worker/keystore) — prominent, rendered first.
     pub primary: Vec<AppRowView>,
     /// Supporting dstack infrastructure (kms/gateway/unknown) — muted, rendered below.
@@ -200,6 +202,12 @@ pub struct CvmView {
     /// Rendered as "instance N of M" only when M > 1 (a single instance shows no marker).
     pub instance_index: usize,
     pub instance_total: usize,
+    /// "last push N ago" freshness for THIS instance — computed from the `received_at` of the node
+    /// report this instance came from (same bucketing the index used to use). The freshness belongs
+    /// on the worker (detail) page now: each instance card shows its own.
+    pub last_seen_human: String,
+    /// "live" | "stale" | "dead" — colors the per-instance freshness pill (`pill-{class}`).
+    pub last_seen_class: &'static str,
     /// Compact per-instance verdict summary for the collapsible `<summary>` header on the detail page
     /// (multi-instance apps). Reuses the SAME `summary_of` logic the index row uses, so the collapsed
     /// chip and the expanded verdict facets can never disagree. "verified" | "failed" | "pending".
@@ -661,13 +669,18 @@ fn aggregate_status(statuses: &[&str]) -> String {
     }
 }
 
-/// Build one compact index APP row from a group of CVM instances sharing one `app_id` (in their
-/// node order — caller guarantees ≥ 1, all with the same `app_id`). Joins each instance with its
-/// verdict (matched by `vm_id`), folds the per-instance summaries into the AGGREGATE chip, derives
-/// a trimmed display name, the instance count, and the aggregate status.
-fn build_app_row(instances: &[&CvmAttestation], verdicts: &[CvmVerdict]) -> AppRowView {
+/// One CVM instance paired with the verdicts slice of the node report it came from. The pairing
+/// matters once instances are grouped GLOBALLY across nodes: a given instance must be joined with
+/// ITS OWN node's verdicts (matched by `vm_id`), not some other node's.
+type Instance<'a> = (&'a CvmAttestation, &'a [CvmVerdict]);
+
+/// Build one compact index APP row from a group of CVM instances sharing one `app_id` (collected
+/// across ALL nodes — caller guarantees ≥ 1, all with the same `app_id`). Joins each instance with
+/// its OWN node's verdict (matched by `vm_id`), folds the per-instance summaries into the AGGREGATE
+/// chip, derives a trimmed display name, the (cross-node) instance count, and the aggregate status.
+fn build_app_row(instances: &[Instance<'_>]) -> AppRowView {
     // ≥ 1 by construction; fall back to a benign empty row only if a caller ever violates that.
-    let Some(first) = instances.first() else {
+    let Some((first, _)) = instances.first() else {
         return AppRowView {
             name: String::new(),
             role_label: role_label(Role::Unknown),
@@ -681,12 +694,12 @@ fn build_app_row(instances: &[&CvmAttestation], verdicts: &[CvmVerdict]) -> AppR
         };
     };
 
-    let summary = Summary::aggregate(instances.iter().map(|c| {
+    let summary = Summary::aggregate(instances.iter().map(|(c, verdicts)| {
         let verdict = verdicts.iter().find(|v| v.vm_id == c.vm_id);
         summary_of(verdict)
     }));
 
-    let statuses: Vec<&str> = instances.iter().map(|c| c.status.as_str()).collect();
+    let statuses: Vec<&str> = instances.iter().map(|(c, _)| c.status.as_str()).collect();
     let count = instances.len();
 
     AppRowView {
@@ -702,18 +715,22 @@ fn build_app_row(instances: &[&CvmAttestation], verdicts: &[CvmVerdict]) -> AppR
     }
 }
 
-/// Group a node's CVMs by `app_id`, preserving first-seen order of both the apps and the instances
-/// within each app. Returns each distinct `app_id`'s instances as a borrowed slice-vec, ready for
-/// `build_app_row`. Pure; no allocation of CVMs (only borrows).
-fn group_by_app<'a>(cvms: &'a [CvmAttestation]) -> Vec<Vec<&'a CvmAttestation>> {
+/// Group EVERY CVM across ALL nodes by `app_id`, GLOBALLY (an app running on two nodes collapses to
+/// ONE group whose instance count folds both). Preserves first-seen order of both the apps and the
+/// instances within each app (node order is the caller's stable node sort). Each instance carries
+/// its own node's verdicts slice so the per-instance verdict join stays correct after the merge.
+/// Pure; only borrows.
+fn group_by_app_global<'a>(nodes: &[StoredNode<'a>]) -> Vec<Vec<Instance<'a>>> {
     let mut order: Vec<&str> = Vec::new();
-    let mut groups: Vec<Vec<&'a CvmAttestation>> = Vec::new();
-    for cvm in cvms {
-        match order.iter().position(|id| *id == cvm.app_id.as_str()) {
-            Some(idx) => groups[idx].push(cvm),
-            None => {
-                order.push(cvm.app_id.as_str());
-                groups.push(vec![cvm]);
+    let mut groups: Vec<Vec<Instance<'a>>> = Vec::new();
+    for node in nodes {
+        for cvm in &node.report.cvms {
+            match order.iter().position(|id| *id == cvm.app_id.as_str()) {
+                Some(idx) => groups[idx].push((cvm, node.verdicts)),
+                None => {
+                    order.push(cvm.app_id.as_str());
+                    groups.push(vec![(cvm, node.verdicts)]);
+                }
             }
         }
     }
@@ -722,12 +739,15 @@ fn group_by_app<'a>(cvms: &'a [CvmAttestation]) -> Vec<Vec<&'a CvmAttestation>> 
 
 /// Build one `CvmView`, joining the CVM with its verdict (matched by `vm_id`). `instance_index`
 /// (1-based) and `instance_total` position this card among the instances sharing the `app_id` so the
-/// detail page can label "instance N of M" when there's more than one.
+/// detail page can label "instance N of M" when there's more than one. `now` + `received_at` (of the
+/// node report this instance came from) compute the per-instance "last push" freshness pill.
 fn build_cvm(
     cvm: &CvmAttestation,
     verdicts: &[CvmVerdict],
     instance_index: usize,
     instance_total: usize,
+    now: u64,
+    received_at: u64,
 ) -> CvmView {
     let verdict = verdicts.iter().find(|v| v.vm_id == cvm.vm_id);
     let summary = summary_of(verdict);
@@ -750,6 +770,8 @@ fn build_cvm(
         vm_id: cvm.vm_id.clone(),
         instance_index,
         instance_total,
+        last_seen_human: humanize_age(now, received_at),
+        last_seen_class: freshness(now, received_at).class(),
         summary_class: summary.class(),
         summary_label: summary.label(),
         kms_in_tee,
@@ -769,36 +791,25 @@ fn build_cvm(
     }
 }
 
-/// Build one `NodeListView` (compact index rows) from a stored report's parts: the node header
-/// (id + freshness) plus one thin `AppRowView` per distinct `app_id` (instances sharing an app_id
-/// collapse into a single row) for the list.
-pub fn build_node_list(
-    now: u64,
-    received_at: u64,
-    report: &NodeReport,
-    verdicts: &[CvmVerdict],
-) -> NodeListView {
-    // Partition each app group into primary (OutLayer worker/keystore) vs supporting dstack infra
-    // (kms/gateway/unknown) by the group's role. Instances of one app share a role, so the first
-    // instance's role classifies the whole group. Order within each bucket is preserved.
+/// Build the single, flat `FleetListView` for the INDEX: collect EVERY CVM across ALL stored nodes,
+/// group GLOBALLY by `app_id` (one row per distinct app_id, instances folded across nodes), then
+/// split each app group into primary (OutLayer worker/keystore) vs supporting dstack infra
+/// (kms/gateway/unknown) by the group's role. Instances of one app share a role, so the first
+/// instance's role classifies the whole group. No node grouping / node_id / freshness here — the
+/// index is location-agnostic; "last push" moved to the per-instance detail card.
+pub fn build_fleet_list(nodes: &[StoredNode<'_>]) -> FleetListView {
     let mut primary: Vec<AppRowView> = Vec::new();
     let mut infra: Vec<AppRowView> = Vec::new();
-    for group in group_by_app(&report.cvms) {
-        let role = group.first().map(|c| c.role).unwrap_or(Role::Unknown);
-        let row = build_app_row(&group, verdicts);
+    for group in group_by_app_global(nodes) {
+        let role = group.first().map(|(c, _)| c.role).unwrap_or(Role::Unknown);
+        let row = build_app_row(&group);
         if is_infrastructure(role) {
             infra.push(row);
         } else {
             primary.push(row);
         }
     }
-    NodeListView {
-        node_id: report.node_id.clone(),
-        last_seen_human: humanize_age(now, received_at),
-        last_seen_class: freshness(now, received_at).class(),
-        primary,
-        infra,
-    }
+    FleetListView { primary, infra }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -812,17 +823,18 @@ const PROOF_EXPLORER_URL: &str = "https://proof.t16z.com";
 /// `os_version` tag (from `vm_config.image`), so this link is just the human-readable release index.
 const DSTACK_RELEASES_URL: &str = "https://github.com/Dstack-TEE/meta-dstack/releases";
 
-/// The index page — the compact LIST. askama compiles `templates/index.html` at build time; field
-/// access there is auto-escaped.
+/// The index page — the compact LIST. ONE flat fleet view (no per-node grouping): the primary apps
+/// then the supporting-infrastructure block. askama compiles `templates/index.html` at build time;
+/// field access there is auto-escaped.
 #[derive(Template)]
 #[template(path = "index.html")]
 pub struct IndexPage {
-    pub nodes: Vec<NodeListView>,
+    pub fleet: FleetListView,
 }
 
 impl IndexPage {
-    pub fn new(nodes: Vec<NodeListView>) -> Self {
-        IndexPage { nodes }
+    pub fn new(fleet: FleetListView) -> Self {
+        IndexPage { fleet }
     }
 
     /// Render to a `String`. Errors (should not happen for a compiled template) bubble up so the
@@ -884,18 +896,18 @@ pub struct StoredNode<'a> {
     pub verdicts: &'a [CvmVerdict],
 }
 
-/// Render the INDEX list: the compact one-row-per-APP (app_id-grouped) view of every stored node,
-/// as of `now`.
+/// Render the INDEX list: ONE flat, location-agnostic list of every APP across ALL stored nodes,
+/// grouped GLOBALLY by `app_id` (an app on multiple nodes is a single row with the combined instance
+/// count). No node headers / node_id / per-node freshness — those are irrelevant on the index (the
+/// "last push" freshness now lives per-instance on the detail page). `now` is unused here (kept for a
+/// stable signature with `render_app`; freshness moved off the index).
 ///
 /// Shared by the live `/` handler and offline tooling so a preview renders through the IDENTICAL
 /// view-model build + template path the public page uses. Pure + side-effect-free: builds the view
 /// model and renders; no IO, no panics.
 pub fn render_index(now: u64, nodes: &[StoredNode<'_>]) -> Result<String, askama::Error> {
-    let views: Vec<NodeListView> = nodes
-        .iter()
-        .map(|n| build_node_list(now, n.received_at, n.report, n.verdicts))
-        .collect();
-    IndexPage::new(views).render_page()
+    let _ = now; // the index no longer shows freshness; it moved to the per-instance detail card.
+    IndexPage::new(build_fleet_list(nodes)).render_page()
 }
 
 /// Render the per-app DETAIL page for `app_id`: the full sectioned layout for EVERY CVM instance
@@ -909,21 +921,21 @@ pub fn render_app(
     now: u64,
     nodes: &[StoredNode<'_>],
 ) -> Result<Option<String>, askama::Error> {
-    let _ = now; // detail page shows per-CVM aspects, not the freshness pill; kept for symmetry.
     if app_id.is_empty() {
         return Ok(None);
     }
-    // Gather every matching CVM instance across all nodes, joined with its verdict. Stable order:
-    // nodes are already sorted by the caller; we preserve their CVM order within each. Collect the
-    // borrows first so we know the total before building (needed for the "instance N of M" label).
-    let matches: Vec<(&CvmAttestation, &[CvmVerdict])> = nodes
+    // Gather every matching CVM instance across all nodes, joined with its verdict AND the
+    // `received_at` of the node report it came from (the per-instance "last push" freshness). Stable
+    // order: nodes are already sorted by the caller; we preserve their CVM order within each. Collect
+    // the borrows first so we know the total before building (needed for "instance N of M").
+    let matches: Vec<(&CvmAttestation, &[CvmVerdict], u64)> = nodes
         .iter()
         .flat_map(|n| {
             n.report
                 .cvms
                 .iter()
                 .filter(|c| c.app_id == app_id)
-                .map(move |c| (c, n.verdicts))
+                .map(move |c| (c, n.verdicts, n.received_at))
         })
         .collect();
 
@@ -934,7 +946,7 @@ pub fn render_app(
     let cvms: Vec<CvmView> = matches
         .into_iter()
         .enumerate()
-        .map(|(i, (c, verdicts))| build_cvm(c, verdicts, i + 1, total))
+        .map(|(i, (c, verdicts, received_at))| build_cvm(c, verdicts, i + 1, total, now, received_at))
         .collect();
     AppDetailPage::new(app_id.to_string(), cvms)
         .render_page()
@@ -1041,8 +1053,9 @@ mod tests {
 
     // ----------------------------- INDEX (list) -----------------------------
 
-    /// The index renders one compact row per CVM, links it to `/app/<app_id>`, and shows the green
-    /// "✓ Verified" summary chip for an approved CVM (under its node header).
+    /// The index renders one compact row per APP, links it to `/app/<app_id>`, and shows the green
+    /// "✓ Verified" summary chip for an approved CVM. The list is FLAT + location-agnostic: NO node
+    /// header / node_id, and NO "last push"/freshness anywhere.
     #[test]
     fn index_lists_rows_with_link_and_verified_summary() {
         let report = NodeReport {
@@ -1053,8 +1066,7 @@ mod tests {
         let verdicts = [approved_verdict()];
         let html = render_index(200, &stored(&report, &verdicts)).expect("render");
 
-        // Node header + role + network present.
-        assert!(html.contains("node-tdx-dal-2"), "node id missing");
+        // Role + network present.
         assert!(html.contains("Worker"), "role label missing");
         assert!(html.contains("mainnet"), "network badge missing");
         // The row links to the per-app detail page, keyed by app_id.
@@ -1064,8 +1076,11 @@ mod tests {
         );
         // Compact GREEN verdict summary for an approved CVM.
         assert!(html.contains("✓ Verified"), "compact Verified summary missing");
-        // Freshness pill on the node header.
-        assert!(html.contains("ago"), "freshness string missing");
+        // The node id / location is GONE from the index (where a CVM runs is irrelevant here).
+        assert!(!html.contains("node-tdx-dal-2"), "node id must NOT appear on the index");
+        // The freshness pill is GONE from the index (it moved to the per-instance detail card).
+        assert!(!html.contains("last push"), "'last push' must NOT appear on the index");
+        assert!(!html.contains("ago"), "freshness string must NOT appear on the index");
         // Display name has the trailing instance-number suffix trimmed.
         assert!(html.contains("mainnet-worker"), "trimmed display name missing");
         // A single-instance app shows NO multi-instance count marker.
@@ -1082,6 +1097,50 @@ mod tests {
             !html.contains("0400020081deadbeef"),
             "raw quote hex leaked into the index list"
         );
+    }
+
+    /// Fleet-level flattening: apps from TWO different nodes that share one `app_id` collapse to a
+    /// SINGLE index row whose instance count folds BOTH nodes — and the index shows no node_id, no
+    /// node header, and no "last push" anywhere.
+    #[test]
+    fn index_global_groups_same_app_id_across_nodes_into_one_row() {
+        // Same app_id ("abc123app"), one instance on each of two distinct nodes.
+        let report_a = NodeReport {
+            node_id: "node-aaa".to_string(),
+            collected_at: 0,
+            cvms: vec![instance("vm-a", "mainnet-worker-1")],
+        };
+        let report_b = NodeReport {
+            node_id: "node-bbb".to_string(),
+            collected_at: 0,
+            cvms: vec![instance("vm-b", "mainnet-worker-2")],
+        };
+        let va = [verdict_for("vm-a")];
+        let vb = [verdict_for("vm-b")];
+        let nodes = vec![
+            StoredNode { received_at: 5, report: &report_a, verdicts: &va },
+            StoredNode { received_at: 5, report: &report_b, verdicts: &vb },
+        ];
+        let html = render_index(10, &nodes).expect("render");
+
+        // Exactly ONE row/link for the shared app_id, even though it runs on two nodes.
+        assert_eq!(
+            html.matches("href=\"/app/abc123app\"").count(),
+            1,
+            "the same app_id across two nodes must collapse to exactly one index row"
+        );
+        // The combined instance count folds BOTH nodes → "2 instances".
+        assert!(
+            html.contains("2 instances"),
+            "instance count must fold instances across nodes"
+        );
+        // Both instances passed → aggregate is the green Verified chip (folded across nodes).
+        assert!(html.contains("✓ Verified"), "cross-node aggregate Verified chip missing");
+        // Neither node's id, nor any node header, nor "last push" appears on the index.
+        assert!(!html.contains("node-aaa"), "first node id leaked onto the index");
+        assert!(!html.contains("node-bbb"), "second node id leaked onto the index");
+        assert!(!html.contains("last push"), "'last push' leaked onto the index");
+        assert!(!html.contains("ago"), "freshness leaked onto the index");
     }
 
     /// Two CVMs that SHARE one app_id collapse into ONE index row carrying a "2 instances" marker
@@ -1172,7 +1231,8 @@ mod tests {
     }
 
     /// A `<script>` injected into a CVM name MUST come out escaped on the INDEX list (auto-escaping,
-    /// no XSS). The node id's injected tag is escaped too.
+    /// no XSS). The node id is no longer rendered on the index, so it cannot be an XSS sink there —
+    /// we assert it is absent (escaped or not).
     #[test]
     fn index_escapes_injected_script_in_name() {
         let mut cvm = sample_cvm("<script>alert(1)</script>");
@@ -1190,7 +1250,9 @@ mod tests {
             "raw <script> from name leaked into the index — XSS!"
         );
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "name not escaped");
-        assert!(html.contains("n&lt;script&gt;"), "node id not escaped");
+        // The node id is no longer rendered on the index (neither raw nor escaped).
+        assert!(!html.contains("n<script>"), "raw node id leaked onto the index");
+        assert!(!html.contains("n&lt;script&gt;"), "node id must not appear on the index at all");
     }
 
     /// Empty report set → the friendly empty-state message.
@@ -1323,12 +1385,12 @@ mod tests {
 
         assert!(
             html.contains("Supporting infrastructure"),
-            "infra-only node must still show the subheading"
+            "an infra-only fleet must still show the subheading"
         );
         assert!(html.contains("href=\"/app/kms-app\""), "kms link missing");
         assert!(html.contains("href=\"/app/gw-app\""), "gateway link missing");
-        // The node header still renders even with no primary apps.
-        assert!(html.contains("node-infra-only"), "node header missing");
+        // No node header / node_id on the index even when there are no primary apps.
+        assert!(!html.contains("node-infra-only"), "node id must NOT appear on the index");
     }
 
     // ----------------------------- DETAIL (/app/:app_id) -----------------------------
@@ -1382,6 +1444,57 @@ mod tests {
         );
         // Independent-verify link present.
         assert!(html.contains("https://proof.t16z.com"), "proof link missing");
+    }
+
+    /// The detail page shows the "last push N ago" freshness PER INSTANCE, with the colored
+    /// freshness class — computed from the `received_at` of the node report each instance came from.
+    /// (This is the pill that moved OFF the index.)
+    #[test]
+    fn detail_shows_last_push_freshness_per_instance() {
+        let report = NodeReport {
+            node_id: "node-1".to_string(),
+            collected_at: 0,
+            cvms: vec![sample_cvm("mainnet-worker-1")],
+        };
+        let verdicts = [approved_verdict()];
+        // received_at = 5 (from `stored`), now = 1000 → age 995s → "16m ago", which is the STALE
+        // bucket (>10m, <1h) → pill-stale.
+        let html = render_app("abc123app", 1000, &stored(&report, &verdicts))
+            .expect("render")
+            .expect("Some");
+        assert!(html.contains("last push"), "per-instance 'last push' freshness missing on detail");
+        assert!(html.contains("16m ago"), "humanized freshness age missing");
+        assert!(html.contains("pill-stale"), "freshness class (stale) missing");
+    }
+
+    /// Two instances of one app, pushed at DIFFERENT times by two nodes, each render THEIR OWN
+    /// "last push" freshness pill on the detail page (a live one and a dead one).
+    #[test]
+    fn detail_each_instance_shows_its_own_freshness() {
+        let report_a = NodeReport {
+            node_id: "node-1".to_string(),
+            collected_at: 0,
+            cvms: vec![instance("vm-a", "mainnet-worker-1")],
+        };
+        let report_b = NodeReport {
+            node_id: "node-2".to_string(),
+            collected_at: 0,
+            cvms: vec![instance("vm-b", "mainnet-worker-2")],
+        };
+        let va = [verdict_for("vm-a")];
+        let vb = [verdict_for("vm-b")];
+        // now = 10_000. Node A pushed at 9_999 (age 1s → LIVE); node B at 0 (age 10_000s → DEAD).
+        let nodes = vec![
+            StoredNode { received_at: 9_999, report: &report_a, verdicts: &va },
+            StoredNode { received_at: 0, report: &report_b, verdicts: &vb },
+        ];
+        let html = render_app("abc123app", 10_000, &nodes)
+            .expect("render")
+            .expect("Some");
+        // Two distinct freshness pills, one live and one dead.
+        assert_eq!(html.matches("last push").count(), 2, "expected one 'last push' pill per instance");
+        assert!(html.contains("pill-live"), "live instance freshness class missing");
+        assert!(html.contains("pill-dead"), "dead instance freshness class missing");
     }
 
     /// Multiple running instances can share one app_id — the detail page renders ALL of them (each
