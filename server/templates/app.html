@@ -7,16 +7,24 @@
    Every `{{ }}` is auto-escaped by askama — NO `|safe` anywhere, because names / ids / hashes / the
    app-compose / image refs / URLs arrive over the wire (defense-in-depth against XSS).
 
-   Layout per CVM: App header, TDX Hardware Attestation, Source Code, Zero Trust Gateway, App OS,
-   KMS / deploy-time key provisioning — plus our on-chain DAO approval (in the TDX-Hardware verdict row). Honesty: we
-   verify the Intel DCAP signature + TCB chain against Intel's PCS collateral, NOT Intel Trust
-   Authority. #}
+   Multi-instance apps (`instance_total > 1`) wrap each card in a NATIVE `<details>` (no JS): a compact
+   one-line `<summary>` (instance N of M + name + role/network + a verdict chip) collapses the full
+   sections (App header, TDX Hardware, Source Code, Gateway, App OS, KMS). The FIRST instance and any
+   FAILING instance render `open` so problems are never hidden; the rest start collapsed. A
+   single-instance app renders the card plainly — no disclosure triangle for a lone card.
+
+   Honesty: we verify the Intel DCAP signature + TCB chain against Intel's PCS collateral, NOT Intel
+   Trust Authority (footer note). #}
 
 {% block content %}
 <p class="backlink"><a href="/">← all workers</a></p>
 
 <header class="site">
   <h1>OutLayer — TEE Attestation</h1>
+  <p class="site-sub">
+    Verifiable off-chain compute for NEAR ·
+    <a href="https://outlayer.ai/" target="_blank" rel="noopener noreferrer">outlayer.ai ↗</a>
+  </p>
   <p class="tagline">
     Full per-aspect verification for app
     <span class="app-id-head">{{ app_id }}</span>.
@@ -24,17 +32,25 @@
 </header>
 
 <div class="intro">
-  Each card below is one confidential VM (CVM) instance running this app on a self-hosted Intel TDX
-  host, broken down by <strong>verified aspect</strong>. For every CVM we take the hardware-signed TDX
-  <strong>quote</strong>, verify its <strong>Intel DCAP</strong> signature and TCB chain against
-  <strong>Intel's PCS</strong> collateral, and cross-check the measured code against the
-  <strong>on-chain approved measurements</strong>. A green verdict means the TEE is genuine and
-  running exactly the code the contract approved — nothing here is self-asserted, and every quote can
-  be re-verified independently. We verify the Intel DCAP signature chain ourselves; this is
-  <strong>not Intel Trust Authority</strong>.
+  One running instance of this app on a self-hosted Intel TDX host. Every TDX quote is
+  <strong>Intel-DCAP-verified</strong> (signature + TCB, via Intel's PCS) and cross-checked against the
+  <strong>on-chain approved measurements</strong> — independently re-verifiable.
 </div>
 
 {% for cvm in cvms %}
+{% if cvm.instance_total > 1 %}
+<details class="card-details{% if cvm.verdict.failing %} failing{% endif %}"{% if cvm.instance_index == 1 || cvm.verdict.failing %} open{% endif %}>
+  <summary class="card-summary">
+    <span class="count">instance {{ cvm.instance_index }} of {{ cvm.instance_total }}</span>
+    <span class="name">{{ cvm.name }}</span>
+    <span class="badge">{{ cvm.role_label }}</span>
+    {% match cvm.network_label %}
+      {% when Some with (net) %}<span class="badge">{{ net }}</span>
+      {% when None %}
+    {% endmatch %}
+    <span class="sum sum-{{ cvm.summary_class }}">{{ cvm.summary_label }}</span>
+  </summary>
+{% endif %}
 <article class="card{% if cvm.verdict.failing %} failing{% endif %}">
 
   {# ============================ 1. App header ============================ #}
@@ -286,11 +302,15 @@
   </div>
 
 </article>
+{% if cvm.instance_total > 1 %}
+</details>
+{% endif %}
 {% endfor %}
 
 <footer class="site">
-  Quotes are verified server-side against Intel's PCS collateral (Intel DCAP signature chain — not
-  Intel Trust Authority) and cross-checked against on-chain approved measurements. See the source for
-  the verification pipeline.
+  Quotes are verified server-side against Intel's PCS collateral (the Intel DCAP signature chain — we
+  verify it ourselves, this is <strong>not Intel Trust Authority</strong>) and cross-checked against
+  on-chain approved measurements. See the source for the verification pipeline ·
+  <a href="https://outlayer.ai/" target="_blank" rel="noopener noreferrer">outlayer.ai ↗</a>
 </footer>
 {% endblock %}

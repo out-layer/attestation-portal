@@ -134,13 +134,25 @@ impl Summary {
 }
 
 /// One node (one TDX host) as the INDEX list sees it: its header (id + freshness pill) plus the
-/// compact rows for its APPS. Each row is a thin `AppRowView` (no decoded quote / sections) so the
-/// list stays light; the full per-CVM view (`CvmView`) is built only on the detail page.
+/// compact rows for its APPS, split into two groups. The page's purpose is to showcase the
+/// OutLayer-built WORKERS; the shared dstack TEE components (KMS, gateway) are supporting
+/// infrastructure shown below, visually de-emphasized.
+///
+/// * `primary` — OutLayer-built, on-chain-approved apps (`Worker`, `Keystore`). Prominent, shown
+///   FIRST, full row design.
+/// * `infra` — shared dstack TEE components (`Kms`, `Gateway`, `Unknown`). Attested, but not
+///   OutLayer apps — rendered in a muted, compact block UNDER the primary rows.
+///
+/// Each row is a thin `AppRowView` (no decoded quote / sections) so the list stays light; the full
+/// per-CVM view (`CvmView`) is built only on the detail page.
 pub struct NodeListView {
     pub node_id: String,
     pub last_seen_human: String,
     pub last_seen_class: &'static str,
-    pub rows: Vec<AppRowView>,
+    /// OutLayer-built primary apps (worker/keystore) — prominent, rendered first.
+    pub primary: Vec<AppRowView>,
+    /// Supporting dstack infrastructure (kms/gateway/unknown) — muted, rendered below.
+    pub infra: Vec<AppRowView>,
 }
 
 /// One compact index row for an APP (a distinct `app_id` within a node), collapsing every running
@@ -188,6 +200,12 @@ pub struct CvmView {
     /// Rendered as "instance N of M" only when M > 1 (a single instance shows no marker).
     pub instance_index: usize,
     pub instance_total: usize,
+    /// Compact per-instance verdict summary for the collapsible `<summary>` header on the detail page
+    /// (multi-instance apps). Reuses the SAME `summary_of` logic the index row uses, so the collapsed
+    /// chip and the expanded verdict facets can never disagree. "verified" | "failed" | "pending".
+    pub summary_class: &'static str,
+    /// "✓ Verified" | "✗ Check failed" | "verifying…" (mirrors `summary_class`).
+    pub summary_label: &'static str,
     /// True when the key provider is the dstack KMS (keys managed in-TEE), false for local-sgx.
     pub kms_in_tee: bool,
     /// The Zero-Trust-Gateway domain guarded for this CVM (`<app_id>-8081.dstack.outlayer.ai` for a
@@ -322,6 +340,18 @@ fn role_label(role: Role) -> &'static str {
         Role::Keystore => "Keystore",
         Role::Worker => "Worker",
         Role::Unknown => "Unknown",
+    }
+}
+
+/// Is this role SUPPORTING dstack infrastructure (vs a primary OutLayer app)?
+///
+/// The page showcases the OutLayer-built, on-chain-approved apps — `Worker` and `Keystore` — as the
+/// primary rows. `Kms`, `Gateway`, and any `Unknown` CVM are shared dstack TEE components: attested,
+/// but not OutLayer apps, so they render in the muted "supporting infrastructure" block below.
+fn is_infrastructure(role: Role) -> bool {
+    match role {
+        Role::Worker | Role::Keystore => false,
+        Role::Kms | Role::Gateway | Role::Unknown => true,
     }
 }
 
@@ -700,6 +730,7 @@ fn build_cvm(
     instance_total: usize,
 ) -> CvmView {
     let verdict = verdicts.iter().find(|v| v.vm_id == cvm.vm_id);
+    let summary = summary_of(verdict);
     let decoded = verdict
         .and_then(|v| v.decoded.as_ref())
         .map(decoded_report_view);
@@ -719,6 +750,8 @@ fn build_cvm(
         vm_id: cvm.vm_id.clone(),
         instance_index,
         instance_total,
+        summary_class: summary.class(),
+        summary_label: summary.label(),
         kms_in_tee,
         gateway_domain: gateway_domain(cvm.role, &cvm.app_id),
         verdict: build_verdict(verdict),
@@ -745,15 +778,26 @@ pub fn build_node_list(
     report: &NodeReport,
     verdicts: &[CvmVerdict],
 ) -> NodeListView {
-    let rows = group_by_app(&report.cvms)
-        .iter()
-        .map(|group| build_app_row(group, verdicts))
-        .collect();
+    // Partition each app group into primary (OutLayer worker/keystore) vs supporting dstack infra
+    // (kms/gateway/unknown) by the group's role. Instances of one app share a role, so the first
+    // instance's role classifies the whole group. Order within each bucket is preserved.
+    let mut primary: Vec<AppRowView> = Vec::new();
+    let mut infra: Vec<AppRowView> = Vec::new();
+    for group in group_by_app(&report.cvms) {
+        let role = group.first().map(|c| c.role).unwrap_or(Role::Unknown);
+        let row = build_app_row(&group, verdicts);
+        if is_infrastructure(role) {
+            infra.push(row);
+        } else {
+            primary.push(row);
+        }
+    }
     NodeListView {
         node_id: report.node_id.clone(),
         last_seen_human: humanize_age(now, received_at),
         last_seen_class: freshness(now, received_at).class(),
-        rows,
+        primary,
+        infra,
     }
 }
 
@@ -1159,6 +1203,134 @@ mod tests {
         );
     }
 
+    /// `is_infrastructure` classifies the supporting dstack roles (kms/gateway/unknown) as infra and
+    /// the OutLayer-built apps (worker/keystore) as primary.
+    #[test]
+    fn infrastructure_classification_by_role() {
+        assert!(!is_infrastructure(Role::Worker), "worker is a primary app");
+        assert!(!is_infrastructure(Role::Keystore), "keystore is a primary app");
+        assert!(is_infrastructure(Role::Kms), "kms is supporting infra");
+        assert!(is_infrastructure(Role::Gateway), "gateway is supporting infra");
+        assert!(is_infrastructure(Role::Unknown), "unknown is treated as infra");
+    }
+
+    /// A CVM with the given role/app_id/vm_id, otherwise a standard sample. Used to build mixed-role
+    /// nodes for the primary-vs-infrastructure split tests.
+    fn cvm_role(role: Role, app_id: &str, vm_id: &str, name: &str) -> CvmAttestation {
+        let mut c = sample_cvm(name);
+        c.role = role;
+        c.app_id = app_id.to_string();
+        c.vm_id = vm_id.to_string();
+        // kms/gateway are net-agnostic; keep a network only for worker/keystore.
+        if matches!(role, Role::Kms | Role::Gateway | Role::Unknown) {
+            c.network = None;
+        }
+        c
+    }
+
+    /// A node carrying a worker + keystore (primary) plus a kms + gateway (supporting infra):
+    /// * the worker & keystore render in the PRIMARY group, the kms & gateway under the
+    ///   "Supporting infrastructure" block;
+    /// * every infra row STILL links to `/app/<app_id>` (just downranked);
+    /// * the primary rows appear BEFORE the infra block in the HTML (asserted by byte offset).
+    #[test]
+    fn index_splits_primary_apps_from_supporting_infrastructure() {
+        let report = NodeReport {
+            node_id: "node-tdx-dal-2".to_string(),
+            collected_at: 0,
+            cvms: vec![
+                cvm_role(Role::Worker, "worker-app", "vm-w", "mainnet-worker-1"),
+                cvm_role(Role::Keystore, "keystore-app", "vm-k", "mainnet-keystore-1"),
+                cvm_role(Role::Kms, "kms-app", "vm-kms", "kms"),
+                cvm_role(Role::Gateway, "gw-app", "vm-gw", "dstack-gateway"),
+            ],
+        };
+        // One verdict per instance so every row resolves to a concrete summary.
+        let verdicts = [
+            verdict_for("vm-w"),
+            verdict_for("vm-k"),
+            verdict_for("vm-kms"),
+            verdict_for("vm-gw"),
+        ];
+        let html = render_index(10, &stored(&report, &verdicts)).expect("render");
+
+        // The supporting-infrastructure subheading + note appear (infra is present).
+        assert!(
+            html.contains("Supporting infrastructure"),
+            "infra subheading missing"
+        );
+        assert!(
+            html.contains("Shared dstack TEE components"),
+            "infra one-line note missing"
+        );
+
+        // All four apps still link to their detail pages, including the infra ones (inspectable).
+        for app in ["worker-app", "keystore-app", "kms-app", "gw-app"] {
+            assert!(
+                html.contains(&format!("href=\"/app/{app}\"")),
+                "link to /app/{app} missing"
+            );
+        }
+
+        // The worker & keystore are in the PRIMARY list (before the infra subheading); the kms &
+        // gateway are in the INFRA block (after it). Assert ordering by byte offset.
+        let infra_at = html
+            .find("Supporting infrastructure")
+            .expect("infra subheading offset");
+        let worker_at = html.find("/app/worker-app").expect("worker link offset");
+        let keystore_at = html.find("/app/keystore-app").expect("keystore link offset");
+        let kms_at = html.find("/app/kms-app").expect("kms link offset");
+        let gw_at = html.find("/app/gw-app").expect("gateway link offset");
+
+        assert!(worker_at < infra_at, "worker must render before the infra block");
+        assert!(keystore_at < infra_at, "keystore must render before the infra block");
+        assert!(kms_at > infra_at, "kms must render under the infra block");
+        assert!(gw_at > infra_at, "gateway must render under the infra block");
+    }
+
+    /// When a node has ONLY primary apps (no kms/gateway), the "Supporting infrastructure" subheading
+    /// is NOT emitted (the muted block is conditional on infra being present).
+    #[test]
+    fn index_omits_infra_subheading_when_no_infrastructure() {
+        let report = NodeReport {
+            node_id: "node-primary-only".to_string(),
+            collected_at: 0,
+            cvms: vec![cvm_role(Role::Worker, "worker-app", "vm-w", "mainnet-worker-1")],
+        };
+        let verdicts = [verdict_for("vm-w")];
+        let html = render_index(10, &stored(&report, &verdicts)).expect("render");
+        assert!(html.contains("href=\"/app/worker-app\""), "worker row missing");
+        assert!(
+            !html.contains("Supporting infrastructure"),
+            "infra subheading must be absent when a node has no infrastructure CVMs"
+        );
+    }
+
+    /// Edge case: a node with ONLY infra CVMs (no worker/keystore) still renders them — under the
+    /// "Supporting infrastructure" subheading, each still linking to its detail page.
+    #[test]
+    fn index_infra_only_node_still_renders_under_subheading() {
+        let report = NodeReport {
+            node_id: "node-infra-only".to_string(),
+            collected_at: 0,
+            cvms: vec![
+                cvm_role(Role::Kms, "kms-app", "vm-kms", "kms"),
+                cvm_role(Role::Gateway, "gw-app", "vm-gw", "dstack-gateway"),
+            ],
+        };
+        let verdicts = [verdict_for("vm-kms"), verdict_for("vm-gw")];
+        let html = render_index(10, &stored(&report, &verdicts)).expect("render");
+
+        assert!(
+            html.contains("Supporting infrastructure"),
+            "infra-only node must still show the subheading"
+        );
+        assert!(html.contains("href=\"/app/kms-app\""), "kms link missing");
+        assert!(html.contains("href=\"/app/gw-app\""), "gateway link missing");
+        // The node header still renders even with no primary apps.
+        assert!(html.contains("node-infra-only"), "node header missing");
+    }
+
     // ----------------------------- DETAIL (/app/:app_id) -----------------------------
 
     /// The detail page for a known app_id carries the full section layout, the decoded quote, the
@@ -1264,6 +1436,196 @@ mod tests {
         assert!(
             !html.contains("instance 1 of"),
             "single-instance app must not show an 'instance N of M' marker"
+        );
+    }
+
+    /// Multi-instance detail page: each card is wrapped in a `<details class="card-details">`; the
+    /// FIRST instance renders `open` and the second starts collapsed (no `open`), while BOTH
+    /// instances' full sections still render. Default-open keeps the first instance expanded.
+    #[test]
+    fn detail_multi_instance_wraps_in_details_first_open() {
+        let report = NodeReport {
+            node_id: "node-1".to_string(),
+            collected_at: 0,
+            cvms: vec![
+                instance("vm-a", "mainnet-worker-1"),
+                instance("vm-b", "mainnet-worker-2"),
+            ],
+        };
+        let verdicts = [verdict_for("vm-a"), verdict_for("vm-b")];
+        let html = render_app("abc123app", 10, &stored(&report, &verdicts))
+            .expect("render")
+            .expect("Some");
+
+        // Each instance card is wrapped in a collapsible <details class="card-details ...">.
+        assert_eq!(
+            html.matches("<details class=\"card-details").count(),
+            2,
+            "expected two collapsible instance wrappers"
+        );
+        // The FIRST opens; the SECOND (passing, non-first) is collapsed.
+        let first_open = "<details class=\"card-details\" open>";
+        let second_collapsed = "<details class=\"card-details\">";
+        assert!(html.contains(first_open), "first instance must render open");
+        assert!(
+            html.contains(second_collapsed),
+            "a passing non-first instance must start collapsed (no open)"
+        );
+        // A compact verdict chip rides in each <summary>.
+        assert!(html.contains("✓ Verified"), "summary verdict chip missing");
+        // BOTH instances' full sections still render (revealed on click; markup is present).
+        assert!(html.contains("instance 1 of 2"), "instance 1 marker missing");
+        assert!(html.contains("instance 2 of 2"), "instance 2 marker missing");
+        assert_eq!(
+            html.matches("<article class=\"card").count(),
+            2,
+            "both instance cards must render their sections"
+        );
+        assert_eq!(
+            html.matches("<h3>TDX Hardware — Attestation</h3>").count(),
+            2,
+            "both instances must render the TDX section body"
+        );
+    }
+
+    /// A FAILING non-first instance is ALSO rendered `open` (problems are never hidden), even though
+    /// a passing non-first instance would start collapsed.
+    #[test]
+    fn detail_multi_instance_failing_non_first_is_open() {
+        let report = NodeReport {
+            node_id: "node-1".to_string(),
+            collected_at: 0,
+            cvms: vec![
+                instance("vm-a", "mainnet-worker-1"),
+                instance("vm-b", "mainnet-worker-2"),
+                instance("vm-c", "mainnet-worker-3"),
+            ],
+        };
+        // vm-a passes (first → open), vm-b passes (non-first → collapsed), vm-c FAILS (→ open).
+        let mut bad = verdict_for("vm-c");
+        bad.on_chain_approved = Some(false);
+        let verdicts = [verdict_for("vm-a"), verdict_for("vm-b"), bad];
+        let html = render_app("abc123app", 10, &stored(&report, &verdicts))
+            .expect("render")
+            .expect("Some");
+
+        // Three wrappers; the failing one carries the `failing` class AND `open`.
+        assert_eq!(html.matches("<details class=\"card-details").count(), 3, "three wrappers");
+        assert!(
+            html.contains("<details class=\"card-details failing\" open>"),
+            "a failing non-first instance must render open (problems never hidden)"
+        );
+        // Exactly two `open` wrappers total: the first (passing) and the failing third.
+        assert_eq!(
+            html.matches("card-details\" open>").count() + html.matches("card-details failing\" open>").count(),
+            2,
+            "exactly the first and the failing instance should be open"
+        );
+        assert!(html.contains("✗ Check failed"), "failing summary chip missing");
+    }
+
+    /// A SINGLE-instance app detail page renders the card PLAINLY — NO `card-details` collapsible
+    /// wrapper around the card (a lone card gets no disclosure triangle). The inner `<details>` for
+    /// the raw quote / compose is unrelated and may still appear.
+    #[test]
+    fn detail_single_instance_has_no_card_details_wrapper() {
+        let report = NodeReport {
+            node_id: "node-1".to_string(),
+            collected_at: 0,
+            cvms: vec![sample_cvm("mainnet-worker-1")],
+        };
+        let verdicts = [approved_verdict()];
+        let html = render_app("abc123app", 10, &stored(&report, &verdicts))
+            .expect("render")
+            .expect("Some");
+        // No collapsible card wrapper is emitted in the body ("card-details" still appears once in
+        // the inline CSS, so match the actual open-tag, not the bare class name).
+        assert!(
+            !html.contains("<details class=\"card-details"),
+            "a single-instance app must not wrap its lone card in a collapsible <details>"
+        );
+        assert!(
+            !html.contains("<summary class=\"card-summary\""),
+            "a single-instance app must not render a collapse summary header"
+        );
+        // The card itself still renders.
+        assert_eq!(html.matches("<article class=\"card").count(), 1, "lone card missing");
+    }
+
+    /// The multi-instance `<summary>` chip escapes an injected `<script>` in the instance name too
+    /// (auto-escaping holds in the collapsed header, not just the expanded body).
+    #[test]
+    fn detail_multi_instance_summary_escapes_script() {
+        let mut a = instance("vm-a", "<script>alert(1)</script>");
+        a.network = None;
+        let mut b = instance("vm-b", "mainnet-worker-2");
+        b.network = None;
+        let report = NodeReport {
+            node_id: "node-1".to_string(),
+            collected_at: 0,
+            cvms: vec![a, b],
+        };
+        let verdicts = [verdict_for("vm-a"), verdict_for("vm-b")];
+        let html = render_app("abc123app", 10, &stored(&report, &verdicts))
+            .expect("render")
+            .expect("Some");
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "raw <script> leaked into the collapsible summary — XSS!"
+        );
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "summary name not escaped"
+        );
+    }
+
+    /// Both pages link out to the main site and carry the shortened intro (the old long
+    /// "Each card below…/Each row below…" lead-ins are gone).
+    #[test]
+    fn pages_link_to_main_site_and_have_short_intro() {
+        // DETAIL page.
+        let report = NodeReport {
+            node_id: "node-1".to_string(),
+            collected_at: 0,
+            cvms: vec![sample_cvm("mainnet-worker-1")],
+        };
+        let verdicts = [approved_verdict()];
+        let detail = render_app("abc123app", 10, &stored(&report, &verdicts))
+            .expect("render")
+            .expect("Some");
+        assert!(detail.contains("https://outlayer.ai/"), "detail: outlayer.ai link missing");
+        assert!(
+            detail.contains("independently re-verifiable"),
+            "detail: shortened intro copy missing"
+        );
+        assert!(
+            !detail.contains("Each card below is one confidential VM"),
+            "detail: old long intro sentence must be gone"
+        );
+        // The honesty note still appears (moved to the footer).
+        assert!(
+            detail.contains("not Intel Trust Authority"),
+            "detail: honest 'not ITA' note must remain (in footer)"
+        );
+
+        // INDEX page.
+        let index = render_index(200, &stored(&report, &verdicts)).expect("render");
+        assert!(index.contains("https://outlayer.ai/"), "index: outlayer.ai link missing");
+        assert!(
+            index.contains("for the full breakdown"),
+            "index: shortened intro copy missing"
+        );
+        assert!(
+            index.contains("Intel-DCAP-verified"),
+            "index: shortened intro copy missing"
+        );
+        assert!(
+            !index.contains("Each row below is one confidential VM"),
+            "index: old long intro sentence must be gone"
+        );
+        assert!(
+            index.contains("not Intel Trust Authority"),
+            "index: honest 'not ITA' note must remain (in footer)"
         );
     }
 

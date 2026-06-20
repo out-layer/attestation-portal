@@ -36,6 +36,7 @@
     a { color: var(--accent); }
     .wrap { max-width: 1040px; margin: 0 auto; padding: 32px 20px 80px; }
     header.site h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: .2px; }
+    header.site .site-sub { color: var(--muted); margin: 0 0 6px; font-size: 13px; }
     header.site .tagline { color: var(--muted); margin: 0; }
     .intro {
       background: var(--panel);
@@ -113,6 +114,45 @@
     .sum-failed { color: var(--bad); background: var(--bad-bg); border-color: #5c2220; }
     .sum-pending { color: var(--accent); background: #122031; border-color: #1d3a5c; }
 
+    /* Supporting dstack infrastructure (KMS / gateway / unknown) — visually DE-EMPHASIZED below the
+       primary worker rows: smaller subheading, muted note, compact greyed rows with a quiet verdict
+       DOT (not the full chip). Still clickable links to /app/<app_id>, just downranked. */
+    .infra-head {
+      margin: 26px 0 2px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      color: var(--muted);
+    }
+    .infra-note { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+    ul.rows.infra .row-item { margin: 4px 0; }
+    ul.rows.infra .row-link {
+      gap: 8px;
+      padding: 7px 12px;
+      background: transparent;
+      border-color: var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    ul.rows.infra .row-link:hover { border-color: var(--na); background: var(--na-bg); }
+    ul.rows.infra .row-name { font-weight: 500; color: var(--muted); font-size: 13px; }
+    ul.rows.infra .badge {
+      font-size: 10px;
+      padding: 1px 6px;
+      background: transparent;
+      color: var(--muted);
+    }
+    ul.rows.infra .row-status { font-size: 12px; }
+    ul.rows.infra .count { font-size: 10px; padding: 1px 6px; color: var(--muted); }
+    /* Quiet verdict indicator: a small colored dot in place of the full verdict chip. */
+    .infra-dot { font-size: 12px; line-height: 1; flex: 0 0 auto; }
+    .infra-verified { color: var(--good); }
+    .infra-failed { color: var(--bad); }
+    .infra-pending { color: var(--na); }
+    .row-chevron.infra-chevron { font-size: 14px; }
+
     /* Detail page — back-link + app-id in the header. */
     .backlink { margin: 0 0 8px; font-size: 13px; }
     .app-id-head { font-family: var(--mono); color: var(--fg); word-break: break-all; }
@@ -127,6 +167,45 @@
     .card.failing { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad) inset; }
     .card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .card-head .name { font-family: var(--mono); font-weight: 600; }
+
+    /* Multi-instance apps: each card is a native <details>. The <details> carries the card chrome;
+       the inner .card goes borderless so it doesn't double up. The <summary> is a compact, clickable
+       one-line header (instance N of M + name + role/network + a verdict chip). No JS. */
+    .card-details {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin: 16px 0;
+    }
+    .card-details.failing { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad) inset; }
+    .card-details > .card {
+      border: 0;
+      box-shadow: none;
+      border-radius: 0;
+      margin: 0;
+      padding-top: 0;
+    }
+    .card-summary {
+      cursor: pointer;
+      user-select: none;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 14px 18px;
+      list-style: none;
+    }
+    .card-summary::-webkit-details-marker { display: none; }
+    .card-summary::before {
+      content: "▸";
+      color: var(--muted);
+      font-size: 12px;
+      flex: 0 0 auto;
+    }
+    .card-details[open] > .card-summary::before { content: "▾"; }
+    .card-details[open] > .card-summary { border-bottom: 1px solid var(--border); }
+    .card-summary .name { font-family: var(--mono); font-weight: 600; }
+    .card-summary .sum { margin-left: auto; }
 
     /* Per-CVM "verified aspect" sections (vertical stack). */
     .sec {
@@ -295,6 +374,7 @@
       margin-top: 30px;
     }
     footer.site { margin-top: 50px; color: var(--muted); font-size: 12.5px; }
+    footer.site strong { color: var(--fg); font-weight: 600; }
   </style>
 </head>
 <body>
