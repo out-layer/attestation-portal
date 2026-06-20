@@ -52,13 +52,25 @@ fn rpc_url(network: &str) -> Option<&'static str> {
     }
 }
 
+/// The NEAR top-level account suffix for a network: **mainnet accounts end in `.near`**, testnet in
+/// `.testnet`. So `worker.outlayer` on mainnet is `worker.outlayer.near`, NOT `worker.outlayer.mainnet`.
+fn near_tla(network: &str) -> Option<&'static str> {
+    match network {
+        "mainnet" => Some("near"),
+        "testnet" => Some("testnet"),
+        _ => None,
+    }
+}
+
 /// The on-chain contract that holds the approved-measurements list for a (role, network) pair.
-/// `Worker` → the register-contract; `Keystore` → the keystore DAO. Kms/Gateway/Unknown, or a
-/// net-agnostic CVM, have no applicable contract (returns `None` → on-chain check skipped).
+/// `Worker` → the register-contract; `Keystore` → the keystore DAO. Kms/Gateway/Unknown, a
+/// net-agnostic CVM, or an unknown network have no applicable contract (returns `None` → on-chain
+/// check skipped).
 fn approval_contract(role: Role, network: &str) -> Option<String> {
+    let tla = near_tla(network)?;
     match role {
-        Role::Worker => Some(format!("worker.outlayer.{network}")),
-        Role::Keystore => Some(format!("dao.outlayer.{network}")),
+        Role::Worker => Some(format!("worker.outlayer.{tla}")),
+        Role::Keystore => Some(format!("dao.outlayer.{tla}")),
         Role::Kms | Role::Gateway | Role::Unknown => None,
     }
 }
@@ -481,7 +493,15 @@ mod tests {
     fn approval_contract_by_role() {
         assert_eq!(
             approval_contract(Role::Worker, "mainnet").as_deref(),
-            Some("worker.outlayer.mainnet")
+            Some("worker.outlayer.near")
+        );
+        assert_eq!(
+            approval_contract(Role::Worker, "testnet").as_deref(),
+            Some("worker.outlayer.testnet")
+        );
+        assert_eq!(
+            approval_contract(Role::Keystore, "mainnet").as_deref(),
+            Some("dao.outlayer.near")
         );
         assert_eq!(
             approval_contract(Role::Keystore, "testnet").as_deref(),
