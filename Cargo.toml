@@ -6,7 +6,7 @@ members = ["shared", "agent", "server"]
 
 [workspace.package]
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 rust-version = "1.85"
 
 [workspace.dependencies]
