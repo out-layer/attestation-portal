@@ -522,7 +522,7 @@ fn image_row(value: &str, service: Option<&str>, version: Option<&str>) -> Optio
     let is_outlayer = image.contains("outlayer/near-outlayer");
     let (origin, release_url) = if is_outlayer {
         let url = version.map(|v| {
-            format!("https://github.com/fastnear/near-outlayer/releases/tag/v{v}")
+            format!("https://github.com/out-layer/outlayer/releases/tag/v{v}")
         });
         ("OutLayer-built", url)
     } else {
@@ -1966,7 +1966,7 @@ mod tests {
         );
         assert_eq!(
             r.release_url.as_deref(),
-            Some("https://github.com/fastnear/near-outlayer/releases/tag/v0.1.35")
+            Some("https://github.com/out-layer/outlayer/releases/tag/v0.1.35")
         );
         assert_eq!(r.origin, "OutLayer-built");
     }
@@ -2034,7 +2034,7 @@ mod tests {
         );
         // The release link for an OutLayer image.
         assert!(
-            html.contains("https://github.com/fastnear/near-outlayer/releases/tag/v0.1.35"),
+            html.contains("https://github.com/out-layer/outlayer/releases/tag/v0.1.35"),
             "release link missing"
         );
         // Dynamic OS version rendered (no hardcoded label).
