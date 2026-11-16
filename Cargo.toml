@@ -24,6 +24,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dcap-qvl = "0.5.2"
 x509-parser = "0.18"
 base64 = "0.22"
+# A keystore's RTMR3 replayed from its boot event log (SHA-384), as the keystore DAO does.
+sha2 = "0.10"
 # Phase 3 public HTML page: compiled, auto-escaping (XSS-safe) templates. We render to a String and
 # wrap in axum::response::Html ourselves — NO askama_axum — to keep the dependency surface minimal
 # (SECURITY.md req 6). default-features off drops mime_guess/humansize/percent-encoding/config we

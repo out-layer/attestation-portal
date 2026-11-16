@@ -3,7 +3,8 @@
 //! Reads an app_cert PEM chain + the 5 reported measurements from env vars, builds a
 //! `CvmAttestation`, and prints the resulting `CvmVerdict` as pretty JSON. Used to validate quote
 //! extraction (OID `1.3.6.1.4.1.62397.1.8`) + dcap-qvl verification + the on-chain
-//! `is_measurements_approved` cross-check against a live node's cert, without standing up the server.
+//! on-chain cross-check against a live node's cert, without standing up the server. It carries no
+//! event log, so a keystore's build check fails here: use `verify_live_report` for a keystore.
 //!
 //! Env:
 //!   CERT_PEM   path to the app_cert PEM chain file                       (required)

@@ -34,7 +34,8 @@
 <div class="intro">
   One running instance of this app on a self-hosted Intel TDX host. Every TDX quote is
   <strong>Intel-DCAP-verified</strong> (signature + TCB, via Intel's PCS) and cross-checked against the
-  <strong>on-chain approved measurements</strong> — independently re-verifiable.
+  <strong>builds approved on chain</strong> (a worker's measurements; a keystore's guest OS and compose,
+  read from its boot event log and approved by the DAO's vote) — independently re-verifiable.
 </div>
 
 {% for cvm in cvms %}
@@ -311,7 +312,7 @@
 <footer class="site">
   Quotes are verified server-side against Intel's PCS collateral (the Intel DCAP signature chain — we
   verify it ourselves, this is <strong>not Intel Trust Authority</strong>) and cross-checked against
-  on-chain approved measurements. See the source for the verification pipeline ·
+  the builds approved on chain. See the source for the verification pipeline ·
   <a href="https://outlayer.ai/" target="_blank" rel="noopener noreferrer">outlayer.ai ↗</a>
 </footer>
 {% endblock %}

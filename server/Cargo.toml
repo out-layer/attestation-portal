@@ -19,6 +19,7 @@ tracing-subscriber.workspace = true
 dcap-qvl.workspace = true
 x509-parser.workspace = true
 base64.workspace = true
+sha2.workspace = true
 # Phase 3: the public HTML attestation page. Compiled templates auto-escape every data field — the
 # page renders names/ids/hashes that ultimately arrive over the wire, so escaping is our XSS defense.
 askama.workspace = true

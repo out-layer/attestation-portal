@@ -11,7 +11,8 @@
 //! later want full history.)
 //!
 //! Phase 2 (this commit): after storing a pushed report, a background task runs dcap-qvl quote
-//! verification + the on-chain `is_measurements_approved` cross-check (see `verify.rs`) and writes
+//! verification + the on-chain cross-check (`is_measurements_approved` for a worker,
+//! `is_build_approved` for a keystore; see `verify.rs`) and writes
 //! the resulting per-CVM `verdicts` back into the stored entry. `/ingest` does NOT wait on it.
 //!
 //! Following phases (to SECURITY.md): the askama public HTML page.

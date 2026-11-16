@@ -2,7 +2,7 @@
 //!
 //! These mirror the normalized attestation snapshot a node agent produces from the dstack vmm
 //! `Status` + each CVM's guest-agent `Info`. The server consumes `NodeReport` to verify quotes
-//! (dcap-qvl) and cross-check measurements against the on-chain approved list.
+//! (dcap-qvl) and cross-check each CVM's build against what is approved on chain.
 
 use serde::{Deserialize, Serialize};
 

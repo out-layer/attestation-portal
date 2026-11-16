@@ -14,8 +14,12 @@
 //!      we record the actual TCB status string and treat ONLY `"UpToDate"` as fully good upstream.
 //!   4. Compare the dcap-qvl-parsed measurements (mr_td / rt_mr0..3) against the report's claimed
 //!      `measurements` — this binds the verified quote to the values the page renders.
-//!   5. Cross-check those measurements against the on-chain approved list (`is_measurements_approved`)
-//!      for worker/keystore CVMs on their network. Net-agnostic CVMs (kms/gateway) skip this.
+//!   5. Cross-check against the chain, for worker/keystore CVMs on their network (net-agnostic
+//!      CVMs — kms/gateway — skip this):
+//!      - a worker: its five measurements on the register contract's list (`is_measurements_approved`);
+//!      - a keystore: its build on the keystore DAO (`is_build_approved`) — the guest OS of the
+//!        verified quote and the compose hash read from the CVM's boot event log, which must
+//!        replay to the quote's RTMR3 (`replay_rtmr3`); an unreplayable log is "not approved".
 //!
 //! All outbound HTTP (Intel PCS via dcap-qvl's own client; NEAR RPC via our own) is bounded by
 //! timeouts so a hung upstream cannot pile up background tasks. The endpoints contacted are fixed
@@ -25,7 +29,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use attestation_shared::{CvmAttestation, Measurements, NodeReport, Role};
+use attestation_shared::{CvmAttestation, EventLogEntry, Measurements, NodeReport, Role};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
@@ -280,7 +284,34 @@ pub async fn verify_cvm(cvm: &CvmAttestation) -> CvmVerdict {
     // 5. On-chain cross-check (worker/keystore on their network only).
     let network = cvm.network.as_deref();
     if let Some(net) = network {
-        if let Some(contract) = approval_contract(cvm.role, net) {
+        if let (Role::Keystore, Some(contract)) = (cvm.role, approval_contract(cvm.role, net)) {
+            v.on_chain_contract = Some(contract.clone());
+            // The build is read from the verified quote and the log that replays to it — never
+            // from the report's claimed measurements or compose hash.
+            let build = quote_measurements(&verified)
+                .ok_or_else(|| anyhow!("verified quote is not a TDX report"))
+                .and_then(|q| {
+                    let (rtmr3, compose_hash) = replay_rtmr3(&cvm.event_log)?;
+                    if !hex_eq(&rtmr3, &q.rtmr3) {
+                        return Err(anyhow!("the boot event log does not replay to the quote's RTMR3"));
+                    }
+                    Ok((q, compose_hash))
+                });
+            match build {
+                Ok((q, compose_hash)) => match check_build_on_chain(&contract, net, &q, &compose_hash).await {
+                    Ok(approved) => v.on_chain_approved = Some(approved),
+                    Err(e) => {
+                        v.error
+                            .get_or_insert_with(|| format!("on-chain check failed: {e:#}"));
+                    }
+                },
+                Err(e) => {
+                    // No build can be read from this CVM: not approved, and the reason shown.
+                    v.on_chain_approved = Some(false);
+                    v.error.get_or_insert_with(|| format!("keystore build: {e:#}"));
+                }
+            }
+        } else if let Some(contract) = approval_contract(cvm.role, net) {
             v.on_chain_contract = Some(contract.clone());
             match cvm.measurements.as_ref() {
                 Some(m) => match check_on_chain(&contract, net, m).await {
@@ -375,25 +406,131 @@ fn hex_eq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
-/// NEAR JSON-RPC `is_measurements_approved` view call against `contract` on `network`.
-///
-/// Returns the contract's bool verdict. Any transport / decode error is an `Err` (→ verdict's
-/// `on_chain_approved` stays `None`, i.e. unknown — never silently "approved").
-async fn check_on_chain(contract: &str, network: &str, m: &Measurements) -> Result<bool> {
-    let url = rpc_url(network).ok_or_else(|| anyhow!("no RPC URL for network {network}"))?;
+/// The five registers as the contracts' `measurements` argument.
+fn measurements_json(m: &Measurements) -> serde_json::Value {
+    serde_json::json!({
+        "mrtd": m.mrtd,
+        "rtmr0": m.rtmr0,
+        "rtmr1": m.rtmr1,
+        "rtmr2": m.rtmr2,
+        "rtmr3": m.rtmr3,
+    })
+}
 
-    // The view method's args. Field names mirror the register-contract's `Measurements` JSON.
-    let args = serde_json::json!({
-        "measurements": {
-            "mrtd": m.mrtd,
-            "rtmr0": m.rtmr0,
-            "rtmr1": m.rtmr1,
-            "rtmr2": m.rtmr2,
-            "rtmr3": m.rtmr3,
+/// A worker: `is_measurements_approved(measurements)` on the register contract.
+async fn check_on_chain(contract: &str, network: &str, m: &Measurements) -> Result<bool> {
+    let args = serde_json::json!({ "measurements": measurements_json(m) });
+    view_bool(contract, network, "is_measurements_approved", &args).await
+}
+
+/// A keystore: `is_build_approved(measurements, compose_hash)` on the keystore DAO — its guest OS
+/// (MRTD, RTMR0-2) and its compose on the lists approved by vote.
+async fn check_build_on_chain(
+    contract: &str,
+    network: &str,
+    m: &Measurements,
+    compose_hash: &str,
+) -> Result<bool> {
+    let args = serde_json::json!({ "measurements": measurements_json(m), "compose_hash": compose_hash });
+    view_bool(contract, network, "is_build_approved", &args).await
+}
+
+/// The register a dstack guest extends with its boot events.
+const APP_IMR: u32 = 3;
+/// The guest OS's last boot event: facts are read only before it.
+const BOOT_END: &str = "system-ready";
+/// Bounds of a log, as the keystore DAO sets them.
+const MAX_EVENTS: usize = 64;
+const MAX_PAYLOAD_HEX: usize = 1024;
+
+/// RTMR3 replayed from a dstack boot event log, and the compose hash the guest OS recorded before
+/// `system-ready`. The rules are the keystore DAO's (keystore-dao-contract/src/event_log.rs): each
+/// digest is sha384(event_type as u32 LE ‖ ":" ‖ event ‖ ":" ‖ payload) computed from the fields —
+/// a digest in the log is not read — and RTMR3 = fold sha384(mr ‖ digest) from 48 zero bytes over
+/// the IMR-3 events in order. At most 64 events, payloads at most 1024 hex, an event name without
+/// ':' and at most 64 bytes, exactly one 64-hex `compose-hash` before `system-ready`.
+fn replay_rtmr3(log: &[EventLogEntry]) -> Result<(String, String)> {
+    use sha2::{Digest, Sha384};
+    if log.len() > MAX_EVENTS {
+        return Err(anyhow!("event log has {} entries, at most {MAX_EVENTS}", log.len()));
+    }
+    let mut mr = [0u8; 48];
+    let mut booted = false;
+    let mut compose_hash: Option<String> = None;
+    for e in log.iter().filter(|e| e.imr == APP_IMR) {
+        let name = e.event.as_deref().unwrap_or("");
+        let payload_hex = e.event_payload.as_deref().unwrap_or("");
+        if payload_hex.len() > MAX_PAYLOAD_HEX {
+            return Err(anyhow!("event '{name}': payload too long"));
         }
-    });
+        // The digest is over `type:name:payload`: a name with a colon could be read as two events.
+        if name.is_empty() || name.contains(':') || name.len() > 64 {
+            return Err(anyhow!("event name '{name}' is not one dstack writes"));
+        }
+        let event_type = u32::try_from(e.event_type)
+            .map_err(|_| anyhow!("event '{name}': event_type {} is not 32-bit", e.event_type))?;
+        let payload = hex_decode(payload_hex)
+            .ok_or_else(|| anyhow!("event '{name}': payload is not hex"))?;
+        let mut h = Sha384::new();
+        h.update(event_type.to_le_bytes());
+        h.update(b":");
+        h.update(name.as_bytes());
+        h.update(b":");
+        h.update(&payload);
+        let digest = h.finalize();
+        let mut ext = Sha384::new();
+        ext.update(mr);
+        ext.update(digest);
+        mr.copy_from_slice(&ext.finalize());
+        if booted {
+            continue;
+        }
+        match name {
+            BOOT_END => booted = true,
+            "compose-hash" => {
+                if compose_hash.is_some() {
+                    return Err(anyhow!("event 'compose-hash' appears twice before {BOOT_END}"));
+                }
+                compose_hash = Some(payload_hex.to_ascii_lowercase());
+            }
+            _ => {}
+        }
+    }
+    if !booted {
+        return Err(anyhow!("event log has no {BOOT_END} event"));
+    }
+    let compose_hash =
+        compose_hash.ok_or_else(|| anyhow!("event log has no compose-hash before {BOOT_END}"))?;
+    if compose_hash.len() != 64 {
+        return Err(anyhow!("compose-hash is {} hex characters, not 64", compose_hash.len()));
+    }
+    Ok((hex_lower(&mr), compose_hash))
+}
+
+/// Decode hex (either case); `None` on an odd length or a non-hex character.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let nib = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    s.as_bytes()
+        .chunks(2)
+        .map(|p| Some(nib(p[0])? << 4 | nib(p[1])?))
+        .collect()
+}
+
+/// A NEAR JSON-RPC view call of `method` on `contract` that returns a bool. Any transport /
+/// decode error is an `Err` (→ the verdict's `on_chain_approved` stays `None`, i.e. unknown —
+/// never silently "approved").
+async fn view_bool(contract: &str, network: &str, method: &str, args: &serde_json::Value) -> Result<bool> {
+    let url = rpc_url(network).ok_or_else(|| anyhow!("no RPC URL for network {network}"))?;
     let args_b64 = base64::engine::general_purpose::STANDARD
-        .encode(serde_json::to_vec(&args).context("serialize view args")?);
+        .encode(serde_json::to_vec(args).context("serialize view args")?);
 
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -403,7 +540,7 @@ async fn check_on_chain(contract: &str, network: &str, m: &Measurements) -> Resu
             "request_type": "call_function",
             "finality": "final",
             "account_id": contract,
-            "method_name": "is_measurements_approved",
+            "method_name": method,
             "args_base64": args_b64,
         }
     });
@@ -430,6 +567,11 @@ async fn check_on_chain(contract: &str, network: &str, m: &Measurements) -> Resu
         return Err(anyhow!("RPC error: {err}"));
     }
 
+    // A failed view (no such method, a panic) answers `.result.error`, a string, instead.
+    if let Some(err) = json.get("result").and_then(|r| r.get("error")).and_then(|e| e.as_str()) {
+        return Err(anyhow!("{method} on {contract}: {err}"));
+    }
+
     // The view result is at `.result.result`: a byte array that decodes to the JSON return value.
     let bytes_val = json
         .get("result")
@@ -441,7 +583,7 @@ async fn check_on_chain(contract: &str, network: &str, m: &Measurements) -> Resu
         serde_json::from_slice(&bytes).context("view return value is not JSON")?;
     parsed
         .as_bool()
-        .ok_or_else(|| anyhow!("is_measurements_approved did not return a bool"))
+        .ok_or_else(|| anyhow!("{method} did not return a bool"))
 }
 
 /// Lowercase-hex a byte slice without pulling in the `hex` crate (deps stay minimal — SECURITY.md).
@@ -510,6 +652,99 @@ mod tests {
         assert_eq!(approval_contract(Role::Kms, "mainnet"), None);
         assert_eq!(approval_contract(Role::Gateway, "mainnet"), None);
         assert_eq!(approval_contract(Role::Unknown, "testnet"), None);
+    }
+
+    /// The real v0.2.5 keystore registration: its boot events as the keystore sent them (digests
+    /// empty) and the RTMR3 of its TDX quote.
+    fn v025() -> (Vec<EventLogEntry>, String, String) {
+        let d: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/keystore_v025_log.json")).unwrap();
+        let events: Vec<EventLogEntry> = serde_json::from_value(d["events"].clone()).unwrap();
+        (events, d["quote_rtmr3"].as_str().unwrap().to_string(), d["compose_hash"].as_str().unwrap().to_string())
+    }
+
+    fn set_payload(log: &mut [EventLogEntry], event: &str, payload: &str) {
+        let e = log.iter_mut().find(|e| e.event.as_deref() == Some(event)).unwrap();
+        e.event_payload = Some(payload.to_string());
+    }
+
+    #[test]
+    fn a_real_keystore_log_replays_to_its_quote_and_names_its_compose() {
+        let (log, rtmr3, compose) = v025();
+        let (got, got_compose) = replay_rtmr3(&log).unwrap();
+        assert_eq!(got, rtmr3);
+        assert_eq!(got_compose, compose);
+    }
+
+    #[test]
+    fn a_digest_in_the_log_is_not_read() {
+        let (mut log, rtmr3, _) = v025();
+        for e in log.iter_mut() {
+            e.digest = "ff".repeat(48);
+        }
+        assert_eq!(replay_rtmr3(&log).unwrap().0, rtmr3);
+    }
+
+    #[test]
+    fn a_changed_fact_no_longer_replays_to_the_quote() {
+        let (mut log, rtmr3, _) = v025();
+        set_payload(&mut log, "compose-hash", &"ab".repeat(32));
+        let (got, compose) = replay_rtmr3(&log).unwrap();
+        assert_ne!(got, rtmr3, "another compose must give another RTMR3");
+        assert_eq!(compose, "ab".repeat(32));
+        let (mut log, rtmr3, _) = v025();
+        set_payload(&mut log, "instance-id", &"00".repeat(20));
+        assert_ne!(replay_rtmr3(&log).unwrap().0, rtmr3);
+    }
+
+    #[test]
+    fn events_of_other_registers_do_not_count() {
+        let (mut log, rtmr3, _) = v025();
+        let mut other = log[0].clone();
+        other.imr = 1;
+        other.event = Some("compose-hash".into());
+        other.event_payload = Some("cd".repeat(32));
+        log.insert(0, other);
+        let (got, compose) = replay_rtmr3(&log).unwrap();
+        assert_eq!(got, rtmr3);
+        assert_ne!(compose, "cd".repeat(32));
+    }
+
+    #[test]
+    fn a_compose_hash_after_system_ready_is_not_the_build() {
+        let (mut log, _, compose) = v025();
+        let mut late = log.iter().find(|e| e.event.as_deref() == Some("compose-hash")).unwrap().clone();
+        late.event_payload = Some("cd".repeat(32));
+        log.push(late);
+        assert_eq!(replay_rtmr3(&log).unwrap().1, compose);
+    }
+
+    #[test]
+    fn a_log_the_dao_would_refuse_is_refused() {
+        let refused = |f: &dyn Fn(&mut Vec<EventLogEntry>), why: &str| {
+            let (mut log, _, _) = v025();
+            f(&mut log);
+            let e = replay_rtmr3(&log).expect_err(why).to_string();
+            assert!(e.contains(why), "{why}: got '{e}'");
+        };
+        refused(&|l| { let c = l.iter().find(|e| e.event.as_deref() == Some("compose-hash")).unwrap().clone(); l.insert(3, c); }, "appears twice");
+        refused(&|l| l.retain(|e| e.event.as_deref() != Some("system-ready")), "no system-ready");
+        refused(&|l| l.retain(|e| e.event.as_deref() != Some("compose-hash")), "no compose-hash");
+        refused(&|l| set_payload(l, "compose-hash", "abcd"), "not 64");
+        refused(&|l| set_payload(l, "app-id", "zz"), "not hex");
+        refused(&|l| set_payload(l, "app-id", &"a".repeat(1026)), "too long");
+        refused(&|l| l[0].event = Some("app-id:x".into()), "not one dstack writes");
+        refused(&|l| l[0].event = None, "not one dstack writes");
+        refused(&|l| l[0].event_type = 1 << 32, "not 32-bit");
+        refused(&|l| { let e = l[0].clone(); l.extend(std::iter::repeat(e).take(MAX_EVENTS)); }, "at most 64");
+    }
+
+    #[test]
+    fn hex_decode_either_case_and_nothing_else() {
+        assert_eq!(hex_decode("00fFa1"), Some(vec![0x00, 0xff, 0xa1]));
+        assert_eq!(hex_decode(""), Some(vec![]));
+        assert_eq!(hex_decode("abc"), None);
+        assert_eq!(hex_decode("zz"), None);
     }
 
     #[test]
